@@ -15,9 +15,11 @@
 
 ```mermaid
 flowchart LR
-    Phone[你的手机] -- "画面/触摸 (WebSocket)" --> Relay["relay :8271"]
+    Phone[你的手机] -- "画面/人工输入意图 (WebSocket)" --> Relay["relay :8271"]
     CF[cloudflared 隧道] --> Relay
-    Relay -- CDP --> Chrome["常驻 headed Chrome<br/>(xvfb 虚拟屏幕)"]
+    Relay -- "CDP: 画面/标签" --> Chrome["常驻 headed Chrome"]
+    Relay -- "X11/XTEST: 人工鼠标键盘" --> Xvfb["xvfb 虚拟屏幕"]
+    Xvfb --> Chrome
     Agent[你的 agent] -- "HTTP JSON" --> T["twitter-tool :8272"]
     Agent -- "HTTP JSON" --> X["xiaohongshu-tool :8273"]
     T -- CDP --> Chrome
@@ -50,7 +52,7 @@ flowchart LR
 
 ### 想更进一步:自己改 Playwright(可选,且次要)
 
-号养好之后,如果还想让脚本那头更稳,可以自己动手改——但请记住它排在养号后面,不是替代品。脚本容易被盯上,差的其实只有两样:**节奏**和**捷径**,而这两样都在你自己的动作代码里,`actions/` 全是开源的 Playwright,想改就改:
+号养好之后,如果确实观察到脚本动作触发风控,还想让脚本那头更稳,可以自己动手改——**没有触发问题时不要为了“像人”而堆随机动作。**它排在养号后面,不是替代品。脚本容易被盯上时,常见差别是两样:**节奏**和**捷径**,而这两样都在你自己的动作代码里,`actions/` 全是开源的 Playwright,想改就改:
 
 - **节奏**:动作之间加随机停顿、别匀速连点;先滑两下、停一下再操作,别一上来就精准命中目标。
 - **捷径**:用真实的按键 / 聚焦 / 滚动事件代替"直接把值塞进输入框";别让目标元素瞬间跳到眼前、别注入 JS、别直接 `goto` 跳 URL——把人操作时那串自然事件补回去。
@@ -75,11 +77,11 @@ flowchart LR
 
 ### Step 1 — 起 relay(那台常驻浏览器)
 
-在 VPS 上部署(2GB 内存的小机实测够用;本地 Mac/Linux 想先试跑,见 [`relay/README.md`](relay/README.md) 的快速开始):
+在 VPS 上部署(2GB 内存的小机实测够用;本地 Linux 想先试跑,或需要了解 macOS 当前限制,见 [`relay/README.md`](relay/README.md) 的快速开始):
 
 ```bash
-# 1. 依赖:xvfb + Chrome(chromium 也行)
-sudo apt install -y xvfb
+# 1. 依赖:xvfb + X11/XTEST 运行库 + Chrome(chromium 也行)
+sudo apt install -y xvfb libx11-6 libxtst6
 # google-chrome-stable 按官方源装,或 apt install chromium-browser
 
 # 2. 代码 + venv
@@ -117,6 +119,8 @@ ingress:
 ### Step 2 — 手机连上,人工登录
 
 手机浏览器打开 `https://browser.example.com`,输一次密码,30 天免登录。你现在看到的就是服务器上那个 Chrome 的画面,点按、滚动、打字都行。
+
+Linux/VPS 上这些人手操作会进入 X11/XTEST，成为 Chrome 收到的操作系统级鼠标/键盘事件；画面、标签页和 viewport 仍由 CDP 管理，agent 的 Playwright 也仍走 CDP。两条输入路径共享同一个 Chrome 和 profile，但不会混成同一种操作来源。
 
 在里面登录 x.com 和小红书。**所有验证码、短信、扫码,都在这一步由人做掉**——这正是整套方案不碰 cookie 导出、不存密码的原因:登录这件事永远由人在浏览器里完成。登录态从此养在服务器的 Chrome profile 里,换手机换电脑都不丢。
 
