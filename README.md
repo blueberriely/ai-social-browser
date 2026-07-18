@@ -61,7 +61,7 @@ flowchart LR
 
 1. **必须用专门小号,绝不能拿主号。** 自动化操作违反 X / 小红书的服务条款,有封号风险,后果自负。
 2. **CDP 端口(9333)绝不能出 `127.0.0.1`。** 它没有任何鉴权,谁碰到它,谁就拥有浏览器里一切网站的登录态。
-3. **动作服务(8272/8273)没有鉴权,只绑回环或内网。** 谁能访问端口,谁就能用你的账号发推。跨机器调用要套带鉴权的反代或走内网。
+3. **动作服务仍只绑回环。** twitter-tool 现在强制 Bearer 密钥且默认禁写,但密钥不是把 8272 暴露公网的理由;xiaohongshu-tool 仍无鉴权。跨机器调用要再套带鉴权的反代或走内网。
 4. **relay(8271)不裸暴露公网。** 走 cloudflare tunnel 之类的隧道加 TLS,密码必须强——登录没有防爆破,这道门就是全部。
 5. **频率闸的默认值故意很小**(每小时发帖 ≤5、互动 ≤20)。这套东西是给"个人 agent 顺手刷刷"设计的,不做多账号、不做代理池、不做验证码破解——那些是刷量工具的需求,不是本项目的。
 
@@ -136,12 +136,16 @@ python3 -m venv venv && venv/bin/pip install -r requirements.txt
 
 ```bash
 cd twitter-tool
+export TW_SERVICE_TOKEN='<至少 32 字节的 ASCII 随机密钥>'
+export TW_ALLOW_WRITE=0
 ../venv/bin/uvicorn app:app --host 127.0.0.1 --port 8272 &
 
-curl -s localhost:8272/health
-# {"ok": true, "tabs": ..., "owned_pages": 0, ...}
+curl -s localhost:8272/health -H "Authorization: Bearer $TW_SERVICE_TOKEN"
+# {"ok": true, "service":"ai-social-browser-twitter", "api_version":2, ...}
 
-curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
+curl -s localhost:8272/twitter -X POST \
+  -H "Authorization: Bearer $TW_SERVICE_TOKEN" \
+  -H 'content-type: application/json' \
   -d '{"action":"feed","n":5}'
 # 应该返回你时间线上的 5 条推文,结构化 JSON
 ```
@@ -151,6 +155,11 @@ curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
 ```bash
 sudo cp /opt/ai-social-browser/actions/systemd/*.service /etc/systemd/system/
 # 改 unit 里的 YOUR_USER 和路径
+# 复制 actions/systemd/twitter-tool.env.example 为 /etc/twitter-tool.env，填入随机密钥并 chmod 600
+# 写动作默认关闭；真要开还要写 TW_ALLOW_WRITE=1 与 TW_EXPECTED_ACTOR=账号handle
+# 旧安装若已有动作日志/运行状态，先执行：
+sudo chmod 600 /opt/ai-social-browser/actions/twitter-tool/actions.log \
+  /opt/ai-social-browser/actions/twitter-tool/runtime-state.json 2>/dev/null || true
 sudo systemctl daemon-reload && sudo systemctl enable --now twitter-tool xiaohongshu-tool
 ```
 
@@ -159,11 +168,14 @@ sudo systemctl daemon-reload && sudo systemctl enable --now twitter-tool xiaohon
 到这一步,接线只剩一段话的事:**把 [`actions/README.md`](actions/README.md) 里「twitter-tool 动作参考」和「xiaohongshu-tool 动作参考」两章原样贴进你 agent 的工具说明**(系统提示、CLAUDE.md、tool description,随你的框架),再告诉它服务地址。agent 会发 HTTP 请求就够了:
 
 ```bash
-curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
-  -d '{"action":"like","url":"https://x.com/.../status/..."}'
+curl -s localhost:8272/twitter -X POST \
+  -H "Authorization: Bearer $TW_SERVICE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 每个逻辑操作唯一且重试时保持不变' \
+  -d '{"action":"like","url":"https://x.com/.../status/...","expected_target_handle":"@目标作者"}'
 ```
 
-有一条务必一起喂给 agent:**写动作返回 `uncertain` 时禁止自动重试**,那表示"可能已经发出去但没验证上",重试就是重复发帖。三态设计的完整说明在 actions 文档里。
+有两条务必一起喂给 agent:每个写操作必须带唯一幂等键,同一次操作重试时沿用原键;**写动作返回 `uncertain` 时禁止自动重试**,那表示"可能已经发出去但没验证上",换个键重试就是重复发帖。三态和账号/目标校验的完整说明在 actions 文档里。
 
 ### Step 5 — 撞墙了,人来接管(兜底,不是日常)
 

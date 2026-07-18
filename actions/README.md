@@ -21,6 +21,7 @@
 - **返回结构化 JSON。** 推文列表直接进上下文，不用截图、不用 dump DOM，省 token 也省事。
 - **写操作全部落审计日志。** 每次点赞/发帖连正文一起记进 `actions.log`，出了事有账可查。
 - **频率闸在服务端。** 每小时发帖 ≤5、互动 ≤20，滑动窗口、跨重启持久化。agent 说破天也绕不过去。
+- **X 服务默认拒绝写。** Bearer 密钥、写开关、当前登录账号、目标作者和幂等键都在服务端硬校验，不靠 agent 自觉。
 - **不碰凭据。** 不导出 cookie、不存密码，登录这件事永远由人在浏览器里做。
 
 ```mermaid
@@ -36,7 +37,7 @@ flowchart LR
 
 ## ⚠️ 安全须知（必读）
 
-1. **服务没有鉴权。** 谁能访问这个端口，谁就能用你的账号发推。只绑 `127.0.0.1` 或内网地址，绝对不要暴露公网。要跨机器调用，套一层带鉴权的反代或走内网。
+1. **twitter-tool 强制 Bearer 鉴权，但仍只应绑定 `127.0.0.1`。** `TW_SERVICE_TOKEN` 未配置时，连读动作都会拒绝；密钥不要写进仓库或命令历史。xiaohongshu-tool 仍无鉴权，更不能暴露公网。
 2. **自动化操作违反 X / 小红书的服务条款**，有封号风险，后果自负。强烈建议用专门账号，别拿主号试。
 3. **频率闸的默认值故意很小**（每小时 5 条发帖、20 次互动）。这个项目是给"个人 agent 顺手刷刷推"设计的，不是营销/刷量工具。数值在 `app.py` 的 `RATE_LIMITS` 里，可以改，但请别把它改成刷量工具。
 4. `actions.log` 是你的真实操作史（含发帖正文），`.gitignore` 已经挡了，自己也别到处拷。
@@ -52,26 +53,30 @@ venv/bin/pip install -r requirements.txt
 # 不需要 playwright install：只连现成浏览器，不下载/启动自己的浏览器
 
 cd twitter-tool
+export TW_SERVICE_TOKEN='<至少 32 字节的 ASCII 随机密钥>'
+# 默认不写；真要开写还必须同时配置 TW_ALLOW_WRITE=1 和 TW_EXPECTED_ACTOR
 ../venv/bin/uvicorn app:app --host 127.0.0.1 --port 8272
 ```
 
 冒烟：
 
 ```bash
-curl -s localhost:8272/health
-# {"ok": true, "tabs": ..., "owned_pages": 0, ...}
+curl -s localhost:8272/health -H "Authorization: Bearer $TW_SERVICE_TOKEN"
+# {"ok": true, "service":"ai-social-browser-twitter", "api_version":2, ...}
 
-curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
+curl -s localhost:8272/twitter -X POST \
+  -H "Authorization: Bearer $TW_SERVICE_TOKEN" \
+  -H 'content-type: application/json' \
   -d '{"action":"feed","n":5}'
 ```
 
 小红书同理（`xiaohongshu-tool` 目录、端口随意、端点是 `POST /xiaohongshu`）。
 
-长期跑用 systemd：`systemd/` 下有两份示例 unit，改掉 `YOUR_USER` 和路径即可。
+长期跑用 systemd：`systemd/` 下有两份示例 unit，改掉 `YOUR_USER` 和路径；再把 `systemd/twitter-tool.env.example` 复制到 `/etc/twitter-tool.env`，填入随机密钥并 `chmod 600`。twitter unit 已用 `UMask=0077` 保护以后新建的日志和状态文件；旧安装若已有文件，还要执行 `chmod 600 actions.log runtime-state.json`（不存在的文件可跳过）。
 
 ## twitter-tool 动作参考
 
-统一入口 `POST /twitter`，body 是 `{"action": "...", ...}`。
+统一入口 `POST /twitter`，body 是 `{"action": "...", ...}`。`GET /health` 和所有动作都必须带 `Authorization: Bearer <TW_SERVICE_TOKEN>`；`POST /twitter` 只接受 `application/json`。
 
 ### 读动作
 
@@ -81,7 +86,7 @@ curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
 | `profile` | `user?` `n?`(≤30) | 某人最近推文；不带 `user` 时回退到 `TW_DEFAULT_USER` |
 | `read` | `url` `n?`(≤40) | 单条推文 + 楼上线程 + 评论；此动作放行图片加载，能拿到图片直链 |
 
-每条推文返回：`url / time / author / handle / text / stats(回复·转发·赞) / liked_by_me / images / has_video / quoted_text / promoted(广告标记) / truncated(长文被折叠)`。
+每条推文返回：`url / time / author / handle / text / stats(回复·转发·赞) / liked_by_me / reposted_by_me / images / has_video / quoted_text / promoted(广告标记) / truncated(长文被折叠)`。
 
 **`read` 命中刚拿到的列表结果时不走 `goto` 硬跳。** 如果传入的 `url` 是最近一次 `feed`/`profile`（还没过期，见下面 `TW_BROWSE_TTL_SECONDS`）返回结果里的推文，会在那个仍然开着的列表页里用真实滚轮找到卡片、真实点击进详情，读完再模拟后退把列表页留住给下一次 `read` 接着用——这是根 README"改 Playwright 别走捷径"里说的那类真实事件。返回结果里的 `navigation` 字段标出走的哪条路：`feed_card_click`（命中列表，点进去的）/ `direct_url_fallback`（外部链接、不在最近列表里，或列表已过期，直接 `goto`）。命中列表但在渲染出的 DOM 里翻不到卡片时，**不会自动降级去硬跳 URL**，而是直接返回 `{"ok": false, "navigation": "card_click_failed", ...}`，避免"看似成功实则走了容易被识别的路径"。
 
@@ -89,10 +94,14 @@ curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
 
 | action | 参数 | 频率组 |
 |---|---|---|
-| `like` / `unlike` | `url` | engage（合计 20 次/小时） |
-| `repost` | `url` | engage |
-| `reply` | `url` `text` | publish（合计 5 次/小时） |
-| `post` | `text` | publish |
+| `like` / `unlike` | `url` `expected_target_handle` `idempotency_key` | engage（合计 20 次/小时） |
+| `repost` | `url` `expected_target_handle` `idempotency_key` | engage |
+| `reply` | `url` `text` `expected_target_handle` `idempotency_key` | publish（合计 5 次/小时） |
+| `post` | `text` `idempotency_key` | publish |
+
+写动作还要同时满足三条硬条件：`TW_ALLOW_WRITE=1`；`TW_EXPECTED_ACTOR` 与 X 页面上实际登录的 handle 一致；每个逻辑操作带一个唯一幂等键。幂等键既可放 body 的 `idempotency_key`，也可放 `Idempotency-Key` header（两处都有时必须完全一致）。已确认/不确定的结果会在同键重来时直接回放；上次若中断在执行中，则返回 `uncertain`，绝不再次点击。只有明确发生在平台点击前、且 `retry_safe:true` 的失败会释放该键，允许同键安全重试。
+
+对目标推文的动作强制要求 `expected_target_handle`，并从**精确 status article**读取实际作者、返回 `target_handle`；缺字段或不一致都会在点击前硬拒绝。当前登录账号也会先在独立预检页读取一次，并在真实写按钮点击前从同一页再核一次，防止错号。
 
 **写动作返回三态**，这是整个项目最重要的设计：
 
@@ -104,7 +113,9 @@ curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
 
 为什么要有 `uncertain`：点了发送但网络监听没抓到响应 ≠ 失败。把"可能已发出"误报成失败，agent 一重试就是重复发帖。验证链分三层：先挂网络监听再点击（捕获 X 的 GraphQL 响应）→ 等按钮状态翻转（UI 确认）→ 发帖/回复类再拿响应里的 tweet id 做一次**纯读取回访**，正文逐字对上才算 `confirmed`。
 
-**读/写动作还都可能返回第四种 `outcome`：`challenge`**——页面命中 X 的人机验证特征（arkose 验证 iframe，或跳到 `/i/flow/challenge` 之类的挑战 URL）时，不会当成普通失败硬试下去，而是立刻停手返回 `{"outcome": "challenge", "retry_safe": false, "hint": "...请用手机接管 browser-relay 完成验证后再试"}`。命中的写动作**不计入频率闸**（没消耗名额，重试语义和"没发生"一致）。这是"自动化卡壳时人来接力"在代码里的落点：agent 看到这个 outcome 就该停，掏出手机走一遍 [`relay/`](../relay/README.md) 里说的人工接管。
+**读动作还可能返回第四种 `outcome`：`challenge`**——页面命中 X 的人机验证特征（arkose 验证 iframe，或跳到 `/i/flow/challenge` 之类的挑战 URL）时，不会当成普通失败硬试下去，而是立刻停手返回 `{"outcome": "challenge", "retry_safe": false, "manual_intervention_required": true, ...}`。写动作要再区分点击发生在挑战前还是后：最终平台写点击前识别到挑战时返回 `outcome: "failed" + status: "challenge" + retry_safe: false`，不占频率额度，人工完成验证后必须用新幂等键发起新操作；平台写点击后才识别到挑战时返回 `outcome: "uncertain" + status: "challenge"`，占一次频率额度并永久禁止自动重试。这是"自动化卡壳时人来接力"在代码里的落点：agent 看到 `manual_intervention_required` 就必须停，掏出手机走一遍 [`relay/`](../relay/README.md) 里说的人工接管。
+
+服务身份/API 主版本仍为 `2`；上述字段都是向后兼容的附加字段，旧调用方仍可只按 `ok/outcome/retry_safe` 处理。
 
 ## xiaohongshu-tool 动作参考
 
@@ -125,13 +136,17 @@ curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
 
 ## 配置
 
-全部走环境变量，都有默认值：
+全部走环境变量；安全相关变量故意没有可用默认值：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `TW_CDP_URL` | `http://127.0.0.1:9333` | 常驻 Chrome 的 CDP 地址 |
+| `TW_SERVICE_TOKEN` | 无（缺失即拒绝） | `/health` 和 `/twitter` 的 Bearer 密钥，至少 32 字节的 ASCII 随机值 |
+| `TW_ALLOW_WRITE` | 非 `1`（关闭） | 只有精确设为 `1` 才允许写动作 |
+| `TW_EXPECTED_ACTOR` | 空（写入被拒） | 允许执行写动作的登录账号 handle，可带或不带 `@` |
 | `TW_DEFAULT_USER` | 空 | `profile` 不带 `user` 时看谁的主页 |
-| `TW_STATE_PATH` | `app.py` 同目录 | 频率窗口 + 自有标签页台账的落盘路径 |
+| `TW_STATE_PATH` | `app.py` 同目录 | 频率窗口 + 幂等记录 + 自有标签页台账的原子落盘路径 |
+| `TW_IDEMPOTENCY_TTL_HOURS` | 168 | 已确认/已失败终态的保留小时数（最少 1 小时）；执行中与 `uncertain` 永不自动过期，必须人工核账 |
 | `TW_ORPHAN_MINUTES` | 30（最小 30） | 遗孤标签页回收阈值 |
 | `TW_BROWSE_TTL_SECONDS` | 180（最小 30） | `feed`/`profile` 留给后续 `read` 点击复用的列表页存活时长 |
 | `XHS_CDP_URL` | `http://127.0.0.1:9333` | 同上，小红书侧 |
@@ -153,18 +168,22 @@ curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
 8. **"登录"两个字不等于掉线。** 页面正文里出现"登录"字样很正常，只在内容确实加载不出来时才去查登录态，否则全是误报。
 9. **关页失败不能污染动作结论。** 发帖成功但收尾关标签页超时，结果必须还是成功——清理失败单独记日志，异步收尾但保证容量信号量最终释放。
 10. **命中列表就点真实卡片，别对已知链接也走 `goto`。** `read` 如果传的是刚从 `feed`/`search`/`profile` 拿到的链接，会在那个还开着的列表页上用真实滚轮/点击找到卡片进详情，读完再模拟后退把列表页留住——比每次都新开页 `goto` 更接近人的操作节奏（呼应根 README"改 Playwright 别走捷径"那条）。只在链接来自外部、不在最近列表里，或列表已经过期时才直接 `goto` 兜底；渲染 DOM 里找不到卡片时也不会静默降级去硬跳，而是明确报错，交给调用方决定要不要重试。
-11. **风控挑战要识别出来单独处理，不能和"页面结构变了"混在一起报错。** 撞上滑块/人机验证特征时，如果只当成普通异常，agent 看到的是和"选择器失效"一样的报错，分不清是该等选择器修复还是该叫人来解个验证码。加了 `ChallengeDetected` 专门识别验证特征，统一转成 `outcome: "challenge"`（写动作还会跳过频率闸计数），让"该叫人接管了"这件事在返回结果里就是明确的。
+11. **风控挑战要识别出来单独处理，不能和"页面结构变了"混在一起报错。** 撞上滑块/人机验证特征时，如果只当成普通异常，agent 看到的是和"选择器失效"一样的报错，分不清是该等选择器修复还是该叫人来解个验证码。加了 `ChallengeDetected` 专门识别验证特征：读动作返回 `outcome: "challenge"`；写动作在最终点击前返回 `failed/status:challenge` 且不计频率，点击后返回 `uncertain/status:challenge` 且计一次频率。两种都要求人工接管，绝不自动重试。
 
 ## 失败路径速查
 
 | 症状 | 原因 | 处理 |
 |---|---|---|
 | `/health` 报"连不上中继浏览器" | 常驻 Chrome 没起 / CDP 地址端口不对 | 起 relay，核对 `*_CDP_URL` |
+| `/health` 返回 401 / 503 | Bearer 不匹配 / `TW_SERVICE_TOKEN` 未配置 | 核对调用方和服务进程使用的是同一密钥 |
+| `/health` 返回 `state_healthy:false` | `runtime-state.json` 损坏或曾经落盘失败 | 服务会保持 fail-closed 且不覆盖原文件；先备份原文件并人工修复/核账，绝不能直接删掉后开写 |
+| 写动作报 `TW_ALLOW_WRITE` / `TW_EXPECTED_ACTOR` | 写硬闸未开 / 当前登录错号 | 核对服务进程环境；不要绕过账号校验 |
+| 幂等记录为执行中 | 上次可能在点击后断线或重启 | **按 `uncertain` 处理，人工确认，不要换键重发同一操作** |
 | 返回"登录态失效" | 浏览器里掉登录了 | 去常驻 Chrome 里人工重新登录 |
 | "等推文加载超时 / 页面结构已变化" | 网慢，或平台改版导致选择器失效 | 重试一次；还不行就得跟着改版更新选择器 |
 | "频率闸：…已用满" | 撞限流窗口 | 等提示的分钟数，窗口是滑动的 |
 | 写动作返回 `uncertain` | 点了但没验证上 | **人工去页面确认，不要重试** |
-| 返回 `outcome: "challenge"` | 撞上平台的人机验证/风控挑战页 | 掏手机走 [`relay/`](../relay/README.md) 人工过一遍验证，写动作没消耗频率闸名额 |
+| 返回 `outcome/status: "challenge"` | 撞上平台的人机验证/风控挑战页 | 掏手机走 [`relay/`](../relay/README.md) 人工过一遍；查看 `write_attempted`：`false` 才没消耗频率名额，`true` 必须按 `uncertain` 人工核账且禁止重试 |
 | `read` 返回 `navigation: "card_click_failed"` | 命中最近列表，但渲染出的 DOM 里没找到对应卡片 | 页面可能还在变化，重试一次；持续失败就当列表已过期，直接传外部链接走兜底 |
 
 ## 边界与不做的事
