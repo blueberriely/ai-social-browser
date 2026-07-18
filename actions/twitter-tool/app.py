@@ -1856,6 +1856,7 @@ async def twitter(req: Request):
                     result = _uncertain(
                         challenge["hint"] + "；写点击可能已经发生，禁止自动重试",
                         status="challenge", platform="twitter",
+                        manual_intervention_required=True,
                         challenge_url=challenge.get("url"))
                 else:
                     result = _failed(

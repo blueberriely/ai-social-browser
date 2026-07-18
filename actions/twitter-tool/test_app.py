@@ -1039,6 +1039,7 @@ class TwitterToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["status"], "challenge")
         self.assertFalse(body["retry_safe"])
         self.assertTrue(body["write_attempted"])
+        self.assertTrue(body["manual_intervention_required"])
         self.assertEqual(len(tw._rate_windows["publish"]), 1)
         self.assertTrue(tw._state_healthy)
         self.assertTrue(second.json()["replayed"])
