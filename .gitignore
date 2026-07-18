@@ -11,3 +11,4 @@ __pycache__/
 # 运行时产物：actions.log 是你的真实操作史（含发帖正文），绝不能进仓库
 actions.log
 runtime-state.json
+.runtime-state.json.*.tmp

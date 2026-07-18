@@ -6,8 +6,11 @@ Wants=browser-relay.service
 [Service]
 Type=simple
 User=YOUR_USER
+UMask=0077
 WorkingDirectory=/opt/ai-social-browser/actions/twitter-tool
-# 服务没有鉴权：只绑回环或内网地址，绝对不要绑公网网卡
+# /etc/twitter-tool.env 至少要有 TW_SERVICE_TOKEN；建议 chmod 600。
+# 写动作默认关闭；开启时还必须设 TW_ALLOW_WRITE=1 和 TW_EXPECTED_ACTOR=handle。
+EnvironmentFile=/etc/twitter-tool.env
 ExecStart=/opt/ai-social-browser/actions/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8272
 # Environment=TW_CDP_URL=http://127.0.0.1:9333
 # Environment=TW_DEFAULT_USER=your_twitter_handle
