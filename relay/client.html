@@ -123,6 +123,8 @@ function connect() {
     status.classList.add('hidden');
     const w = window.innerWidth;
     const h = window.innerHeight - 44;
+    viewportW = w;
+    viewportH = h;
     send({ type: 'resize', width: w, height: h });
   };
 
@@ -130,7 +132,7 @@ function connect() {
     const msg = JSON.parse(e.data);
     if (msg.type === 'frame') {
       screen.src = 'data:image/jpeg;base64,' + msg.data;
-    } else if (msg.type === 'init') {
+    } else if (msg.type === 'init' || msg.type === 'viewport') {
       viewportW = msg.width;
       viewportH = msg.height;
       if (msg.url) urlBar.value = msg.url;
@@ -155,6 +157,10 @@ function connect() {
         tabPanel.appendChild(item);
       });
       tabPanel.classList.add('show');
+    } else if (msg.type === 'input_error') {
+      status.textContent = '操作失败：' + (msg.message || 'X11 输入不可用');
+      status.classList.remove('hidden');
+      setTimeout(() => status.classList.add('hidden'), 2500);
     }
   };
 
@@ -177,11 +183,25 @@ function send(obj) {
 function screenCoords(e) {
   const rect = screen.getBoundingClientRect();
   const touch = e.changedTouches ? e.changedTouches[0] : e;
-  const scaleX = viewportW / rect.width;
-  const scaleY = viewportH / rect.height;
+  const sourceAspect = viewportW / viewportH;
+  const boxAspect = rect.width / rect.height;
+  let imageWidth, imageHeight, offsetX, offsetY;
+  if (boxAspect > sourceAspect) {
+    imageHeight = rect.height;
+    imageWidth = imageHeight * sourceAspect;
+    offsetX = (rect.width - imageWidth) / 2;
+    offsetY = 0;
+  } else {
+    imageWidth = rect.width;
+    imageHeight = imageWidth / sourceAspect;
+    offsetX = 0;
+    offsetY = (rect.height - imageHeight) / 2;
+  }
+  const normalizedX = (touch.clientX - rect.left - offsetX) / imageWidth;
+  const normalizedY = (touch.clientY - rect.top - offsetY) / imageHeight;
   return {
-    x: Math.round((touch.clientX - rect.left) * scaleX),
-    y: Math.round((touch.clientY - rect.top) * scaleY),
+    x: Math.round(Math.max(0, Math.min(1, normalizedX)) * viewportW),
+    y: Math.round(Math.max(0, Math.min(1, normalizedY)) * viewportH),
   };
 }
 
@@ -207,8 +227,14 @@ screen.addEventListener('touchmove', (e) => {
   const dx = c.x - lastTouchX;
   const dy = c.y - lastTouchY;
   if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+    const phase = scrolling ? 'move' : 'start';
     scrolling = true;
-    send({ type: 'scroll', x: c.x, y: c.y, deltaX: -dx * 2, deltaY: -dy * 2 });
+    send({
+      type: 'scroll', phase,
+      x: c.x, y: c.y,
+      deltaX: -dx, deltaY: -dy,
+      timestamp: e.timeStamp,
+    });
     lastTouchX = c.x;
     lastTouchY = c.y;
   }
@@ -219,11 +245,23 @@ screen.addEventListener('touchend', (e) => {
   if (!scrolling && touchStart) {
     const elapsed = Date.now() - touchStartTime;
     if (elapsed < 300) {
-      send({ type: 'tap', x: touchStart.x, y: touchStart.y });
+      send({
+        type: 'tap', x: touchStart.x, y: touchStart.y,
+        durationMs: elapsed, timestamp: e.timeStamp,
+      });
       // 点击后自动弹键盘，方便输入
       setTimeout(() => keyboardInput.focus(), 100);
     }
+  } else if (scrolling) {
+    send({ type: 'scroll_end', timestamp: e.timeStamp });
   }
+  touchStart = null;
+  scrolling = false;
+}, { passive: false });
+
+screen.addEventListener('touchcancel', (e) => {
+  e.preventDefault();
+  if (scrolling) send({ type: 'scroll_end', timestamp: e.timeStamp });
   touchStart = null;
   scrolling = false;
 }, { passive: false });
@@ -232,7 +270,7 @@ screen.addEventListener('touchend', (e) => {
 screen.addEventListener('click', (e) => {
   if (e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents) return;
   const c = screenCoords(e);
-  send({ type: 'tap', x: c.x, y: c.y });
+  send({ type: 'tap', x: c.x, y: c.y, durationMs: 80, timestamp: e.timeStamp });
 });
 
 // --- Toolbar ---
@@ -267,13 +305,13 @@ document.getElementById('btn-keyboard').onclick = () => {
 keyboardInput.addEventListener('input', (e) => {
   const text = e.data;
   if (text) {
-    send({ type: 'type', text });
+    send({ type: 'type', text, inputType: e.inputType, timestamp: e.timeStamp });
   }
 });
 
 keyboardInput.addEventListener('keydown', (e) => {
   if (['Backspace', 'Enter', 'Tab', 'Escape', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
-    send({ type: 'keypress', key: e.key });
+    send({ type: 'keypress', key: e.key, timestamp: e.timeStamp });
     e.preventDefault();
   }
 });

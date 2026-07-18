@@ -78,8 +78,8 @@ flowchart LR
 在 VPS 上部署(2GB 内存的小机实测够用;本地 Mac/Linux 想先试跑,见 [`relay/README.md`](relay/README.md) 的快速开始):
 
 ```bash
-# 1. 依赖:xvfb + Chrome(chromium 也行)
-sudo apt install -y xvfb
+# 1. 依赖:xvfb + Chrome(chromium 也行) + 手机遥控要用的 X11 输入库
+sudo apt install -y xvfb libx11-6 libxtst6
 # google-chrome-stable 按官方源装,或 apt install chromium-browser
 
 # 2. 代码 + venv

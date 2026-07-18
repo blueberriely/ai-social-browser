@@ -88,6 +88,8 @@ curl -s localhost:8272/twitter -X POST \
 
 每条推文返回：`url / time / author / handle / text / stats(回复·转发·赞) / liked_by_me / reposted_by_me / images / has_video / quoted_text / promoted(广告标记) / truncated(长文被折叠)`。
 
+**`read` 命中刚拿到的列表结果时不走 `goto` 硬跳。** 如果传入的 `url` 是最近一次 `feed`/`profile`（还没过期，见下面 `TW_BROWSE_TTL_SECONDS`）返回结果里的推文，会在那个仍然开着的列表页里用真实滚轮找到卡片、真实点击进详情，读完再模拟后退把列表页留住给下一次 `read` 接着用——这是根 README"改 Playwright 别走捷径"里说的那类真实事件。返回结果里的 `navigation` 字段标出走的哪条路：`feed_card_click`（命中列表，点进去的）/ `direct_url_fallback`（外部链接、不在最近列表里，或列表已过期，直接 `goto`）。命中列表但在渲染出的 DOM 里翻不到卡片时，**不会自动降级去硬跳 URL**，而是直接返回 `{"ok": false, "navigation": "card_click_failed", ...}`，避免"看似成功实则走了容易被识别的路径"。
+
 ### 写动作
 
 | action | 参数 | 频率组 |
@@ -111,6 +113,10 @@ curl -s localhost:8272/twitter -X POST \
 
 为什么要有 `uncertain`：点了发送但网络监听没抓到响应 ≠ 失败。把"可能已发出"误报成失败，agent 一重试就是重复发帖。验证链分三层：先挂网络监听再点击（捕获 X 的 GraphQL 响应）→ 等按钮状态翻转（UI 确认）→ 发帖/回复类再拿响应里的 tweet id 做一次**纯读取回访**，正文逐字对上才算 `confirmed`。
 
+**读动作还可能返回第四种 `outcome`：`challenge`**——页面命中 X 的人机验证特征（arkose 验证 iframe，或跳到 `/i/flow/challenge` 之类的挑战 URL）时，不会当成普通失败硬试下去，而是立刻停手返回 `{"outcome": "challenge", "retry_safe": false, "manual_intervention_required": true, ...}`。写动作要再区分点击发生在挑战前还是后：最终平台写点击前识别到挑战时返回 `outcome: "failed" + status: "challenge" + retry_safe: false`，不占频率额度，人工完成验证后必须用新幂等键发起新操作；平台写点击后才识别到挑战时返回 `outcome: "uncertain" + status: "challenge"`，占一次频率额度并永久禁止自动重试。这是"自动化卡壳时人来接力"在代码里的落点：agent 看到 `manual_intervention_required` 就必须停，掏出手机走一遍 [`relay/`](../relay/README.md) 里说的人工接管。
+
+服务身份/API 主版本仍为 `2`；上述字段都是向后兼容的附加字段，旧调用方仍可只按 `ok/outcome/retry_safe` 处理。
+
 ## xiaohongshu-tool 动作参考
 
 统一入口 `POST /xiaohongshu`。**只读**：代码里只有导航、滚动、读 DOM，没有任何点击/输入/发布。为什么不做写：小红书风控比 X 激进得多，写操作的封号风险和收益完全不成比例；只读已经够 agent "看看小红书在聊什么"用了。
@@ -121,6 +127,8 @@ curl -s localhost:8272/twitter -X POST \
 | `search` | `query`(≤100字) `n?` | 搜索笔记 |
 | `read` | `url` `n?`(评论数≤40) | 笔记详情：标题/正文/图片(含 live photo 标记)/标签/互动数/我是否点过赞收藏/评论(含子评论、IP 属地) |
 | `profile` | `url` 或 `user`(24位id) `n?` | 用户资料 + 最近笔记 |
+
+和 twitter-tool 一样，`feed`/`search`/`profile` 返回的笔记如果紧接着被 `read`，会在同一个仍开着的列表页里真实点击封面进详情（不 `goto` 硬跳），读完模拟返回把列表页留住；命中时列表结果里会带 `read_navigation: "card_click_available"` 提示可以这么用，`read` 返回结果里的 `navigation` 字段标实际走的是 `feed_card_click` 还是 `direct_url_fallback`；渲染出的 DOM 里找不到对应封面时返回 `{"ok": false, "navigation": "card_click_failed", ...}`，不会自动降级硬跳。命中平台的验证挑战时（如滑块）同样会中断返回 `{"outcome": "challenge", ...}`，提示掏手机去 [`relay/`](../relay/README.md) 里人工过一遍。
 
 **链接怎么传（重要）：** 小红书的笔记链接依赖 `xsec_token`——平台发的防爬签名，跟着链接走。给 `read` 传 URL 时，**直接用 `feed`/`search`/`profile` 返回结果里的 `url` 字段原样传**最稳；网页版复制的完整链接（带 token）也可用；App 分享出来的 `xhslink.com` 短链直接传即可，`read`/`profile` 会**自动展开**成主站链接再走原流程（展开时只向 xhslink 域名发请求、拿到主站链接就停，中途跳到白名单外的域名一律拒绝）。只拿笔记 ID 自己拼的裸链接没有 token，多半打不开（表现为"等待笔记详情超时：链接可能缺少有效 xsec_token"）。
 
@@ -140,7 +148,9 @@ curl -s localhost:8272/twitter -X POST \
 | `TW_STATE_PATH` | `app.py` 同目录 | 频率窗口 + 幂等记录 + 自有标签页台账的原子落盘路径 |
 | `TW_IDEMPOTENCY_TTL_HOURS` | 168 | 已确认/已失败终态的保留小时数（最少 1 小时）；执行中与 `uncertain` 永不自动过期，必须人工核账 |
 | `TW_ORPHAN_MINUTES` | 30（最小 30） | 遗孤标签页回收阈值 |
+| `TW_BROWSE_TTL_SECONDS` | 180（最小 30） | `feed`/`profile` 留给后续 `read` 点击复用的列表页存活时长 |
 | `XHS_CDP_URL` | `http://127.0.0.1:9333` | 同上，小红书侧 |
+| `XHS_BROWSE_TTL_SECONDS` | 180（最小 30） | 同上，小红书侧 |
 
 频率闸数值在 `twitter-tool/app.py` 顶部的 `RATE_LIMITS`。
 
@@ -154,9 +164,11 @@ curl -s localhost:8272/twitter -X POST \
 4. **频率闸的判断和记账必须都在写锁内。** 放锁外的话，两个并发请求会同时穿过"最后一个名额"。
 5. **资源拦截要分动作。** 默认掐掉 image/media/font 省内存带宽（图片链接从 DOM 属性抓，不用真下载）；但推文详情页必须放行图片——请求被掐时 `img` 元素根本不渲染，抓不到图链。小红书则全程保留图片请求，轮播组件依赖它初始化。
 6. **广告识别的最稳信号是"没有时间戳"。** 推广卡片没有 `time` 元素/永久链接；`placementTracking` 是补充信号。
-7. **小红书的数据从 `window.__INITIAL_STATE__` 拿，比抓 DOM 全得多**（子评论、IP 属地、live photo 全在里面），但那是 Vue 的响应式对象，要先 unwrap `_value` / `_rawValue`；DOM 解析只做兜底。另外笔记详情链接依赖 `xsec_token`：把 `feed`/`search` 返回的完整 URL 原样传给 `read` 最稳，按笔记 ID 自己拼的裸链接大概率打不开（见上文"链接怎么传"）。
+7. **笔记详情优先读渲染出来的 DOM，`window.__INITIAL_STATE__` 降级成兜底。** 早期反过来——直接从 Vue 的响应式内部状态里拿（子评论、IP 属地、live photo 确实全在里面，但要先 unwrap `_value`/`_rawValue`），问题是这是没公开的内部结构，页面一次不大的改版就可能连字段名带路径一起变。现在默认先解析真实渲染出的 DOM，只有关键字段或评论缺失时才去碰 `__INITIAL_STATE__` 补全，返回结果里 `extraction_source` 标了走的是 `dom` 还是 `dom+store_fallback`。另外笔记详情链接依赖 `xsec_token`：把 `feed`/`search` 返回的完整 URL 原样传给 `read` 最稳，按笔记 ID 自己拼的裸链接大概率打不开（见上文"链接怎么传"）。
 8. **"登录"两个字不等于掉线。** 页面正文里出现"登录"字样很正常，只在内容确实加载不出来时才去查登录态，否则全是误报。
 9. **关页失败不能污染动作结论。** 发帖成功但收尾关标签页超时，结果必须还是成功——清理失败单独记日志，异步收尾但保证容量信号量最终释放。
+10. **命中列表就点真实卡片，别对已知链接也走 `goto`。** `read` 如果传的是刚从 `feed`/`search`/`profile` 拿到的链接，会在那个还开着的列表页上用真实滚轮/点击找到卡片进详情，读完再模拟后退把列表页留住——比每次都新开页 `goto` 更接近人的操作节奏（呼应根 README"改 Playwright 别走捷径"那条）。只在链接来自外部、不在最近列表里，或列表已经过期时才直接 `goto` 兜底；渲染 DOM 里找不到卡片时也不会静默降级去硬跳，而是明确报错，交给调用方决定要不要重试。
+11. **风控挑战要识别出来单独处理，不能和"页面结构变了"混在一起报错。** 撞上滑块/人机验证特征时，如果只当成普通异常，agent 看到的是和"选择器失效"一样的报错，分不清是该等选择器修复还是该叫人来解个验证码。加了 `ChallengeDetected` 专门识别验证特征：读动作返回 `outcome: "challenge"`；写动作在最终点击前返回 `failed/status:challenge` 且不计频率，点击后返回 `uncertain/status:challenge` 且计一次频率。两种都要求人工接管，绝不自动重试。
 
 ## 失败路径速查
 
@@ -171,6 +183,8 @@ curl -s localhost:8272/twitter -X POST \
 | "等推文加载超时 / 页面结构已变化" | 网慢，或平台改版导致选择器失效 | 重试一次；还不行就得跟着改版更新选择器 |
 | "频率闸：…已用满" | 撞限流窗口 | 等提示的分钟数，窗口是滑动的 |
 | 写动作返回 `uncertain` | 点了但没验证上 | **人工去页面确认，不要重试** |
+| 返回 `outcome/status: "challenge"` | 撞上平台的人机验证/风控挑战页 | 掏手机走 [`relay/`](../relay/README.md) 人工过一遍；查看 `write_attempted`：`false` 才没消耗频率名额，`true` 必须按 `uncertain` 人工核账且禁止重试 |
+| `read` 返回 `navigation: "card_click_failed"` | 命中最近列表，但渲染出的 DOM 里没找到对应卡片 | 页面可能还在变化，重试一次；持续失败就当列表已过期，直接传外部链接走兜底 |
 
 ## 边界与不做的事
 

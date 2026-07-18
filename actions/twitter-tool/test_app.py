@@ -300,6 +300,54 @@ class TwitterToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"])
         self.assertIn("精确 status", result["error"])
 
+    async def test_card_click_ignores_target_status_inside_nested_quote(self):
+        class Collection:
+            def __init__(self, items):
+                self.items = items
+
+            async def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+        class Article:
+            async def evaluate(self, script):
+                self.assertIs(script, tw.OWN_STATUS_HREF_JS)
+                return "https://x.com/outer/status/999"
+
+            def locator(self, selector):
+                raise AssertionError("外层 status 不匹配时不能去点引用卡链接")
+
+        article = Article()
+        article.assertIs = self.assertIs
+
+        class Page:
+            keyboard = SimpleNamespace(press=mock.AsyncMock())
+            mouse = SimpleNamespace(wheel=mock.AsyncMock())
+            wait_for_timeout = mock.AsyncMock()
+
+            def locator(self, selector):
+                self_test.assertEqual(selector, 'article[data-testid="tweet"]')
+                return Collection([article])
+
+        self_test = self
+        with mock.patch.object(tw, "_raise_if_challenge", new=mock.AsyncMock()):
+            link = await tw._find_tweet_link(Page(), "123")
+        self.assertIsNone(link)
+
+    async def test_restore_list_never_swallows_challenge(self):
+        challenge = tw.ChallengeDetected(tw._challenge_result(
+            "https://x.com/i/flow/challenge"))
+        page = SimpleNamespace(
+            keyboard=SimpleNamespace(press=mock.AsyncMock()),
+            wait_for_function=mock.AsyncMock(),
+        )
+        with mock.patch.object(
+                tw, "wait_tweets", new=mock.AsyncMock(side_effect=challenge)):
+            with self.assertRaises(tw.ChallengeDetected):
+                await tw._restore_twitter_list(page, "123")
+
     def test_extract_js_reports_my_repost_state(self):
         self.assertIn(
             "t.reposted_by_me = !!art.querySelector('button[data-testid=\"unretweet\"]')",
@@ -926,6 +974,75 @@ class TwitterToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["outcome"], "uncertain")
         self.assertFalse(body["retry_safe"])
         self.assertIn("审计日志无法落盘", body["error"])
+
+    async def test_challenge_before_click_requires_human_and_same_key_never_reexecutes(self):
+        self.enable_auth(write=True, actor="owner")
+        calls = 0
+
+        async def challenge_before_click(action, body, expected_actor):
+            nonlocal calls
+            calls += 1
+            raise tw.ChallengeDetected(tw._challenge_result(
+                "https://x.com/account/access"))
+
+        key = "challenge-before-click-001"
+        with mock.patch.object(tw, "_execute_write", new=challenge_before_click):
+            first = await self.request("POST", "/twitter", headers=self.auth, json={
+                "action": "post", "text": "once", "idempotency_key": key,
+            })
+            tw._idempotency.clear()
+            tw._state_loaded = False
+            tw._load_state()
+            second = await self.request("POST", "/twitter", headers=self.auth, json={
+                "action": "post", "text": "once", "idempotency_key": key,
+            })
+
+        body = first.json()
+        self.assertEqual(body["outcome"], "failed")
+        self.assertEqual(body["status"], "challenge")
+        self.assertFalse(body["retry_safe"])
+        self.assertFalse(body["write_attempted"])
+        self.assertTrue(body["manual_intervention_required"])
+        self.assertEqual(len(tw._rate_windows["publish"]), 0)
+        self.assertTrue(tw._state_healthy)
+        self.assertTrue(second.json()["replayed"])
+        self.assertEqual(calls, 1)
+
+    async def test_challenge_after_click_is_uncertain_counted_and_never_reexecutes(self):
+        self.enable_auth(write=True, actor="owner")
+        calls = 0
+
+        async def challenge_after_click(action, body, expected_actor):
+            nonlocal calls
+            calls += 1
+            tracker = tw._write_click_attempted.get()
+            tw.record_rate(action)
+            tracker["rate_recorded"] = True
+            tracker["attempted"] = True
+            raise tw.ChallengeDetected(tw._challenge_result(
+                "https://x.com/i/flow/challenge"))
+
+        key = "challenge-after-click-001"
+        with mock.patch.object(tw, "_execute_write", new=challenge_after_click):
+            first = await self.request("POST", "/twitter", headers=self.auth, json={
+                "action": "post", "text": "once", "idempotency_key": key,
+            })
+            tw._idempotency.clear()
+            tw._state_loaded = False
+            tw._load_state()
+            second = await self.request("POST", "/twitter", headers=self.auth, json={
+                "action": "post", "text": "once", "idempotency_key": key,
+            })
+
+        body = first.json()
+        self.assertEqual(body["outcome"], "uncertain")
+        self.assertEqual(body["status"], "challenge")
+        self.assertFalse(body["retry_safe"])
+        self.assertTrue(body["write_attempted"])
+        self.assertEqual(len(tw._rate_windows["publish"]), 1)
+        self.assertTrue(tw._state_healthy)
+        self.assertTrue(second.json()["replayed"])
+        self.assertEqual(calls, 1)
 
     async def test_every_platform_click_attempt_reserves_rate_before_click(self):
         self.enable_auth(write=True, actor="owner")

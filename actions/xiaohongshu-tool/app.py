@@ -10,16 +10,18 @@ POST /xiaohongshu
   {"action":"profile", "url":"https://www.xiaohongshu.com/user/profile/...", "n":10}
 
 read/profile 的 url 支持 App 分享的 xhslink.com 短链，会先自动展开成主站链接。
-只读边界：仅导航、滚动和读取 DOM/页面状态；不包含点击、输入或发布类动作。
+只读边界：允许为搜索进行导航、点击、输入、滚动和 DOM 读取；不包含发布或互动写动作。
 """
 
 import asyncio
 import os
+import random
 import re
+import time
 import urllib.error
 import urllib.request
 from contextlib import suppress
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 
 from fastapi import FastAPI, Request
 from playwright.async_api import TimeoutError as PWTimeout
@@ -30,6 +32,7 @@ CDP_URL = os.environ.get("XHS_CDP_URL", "http://127.0.0.1:9333").rstrip("/")
 BASE = "https://www.xiaohongshu.com"
 MAX_ITEMS = 30
 MAX_COMMENTS = 40
+BROWSE_TTL_SECONDS = max(30, int(os.environ.get("XHS_BROWSE_TTL_SECONDS", "180")))
 
 # 小红书页面较重；VPS 上一次只开一个工作页，避免和人工 relay 页面抢内存。
 ACTION_LOCK = asyncio.Lock()
@@ -37,8 +40,80 @@ _PAGE_LOCK = asyncio.Lock()
 _CONN_LOCK = asyncio.Lock()
 _pw = None
 _browser = None
+_browse_session = None  # 最近一次 feed/search/profile 列表页
+_sweeper_task = None
 
 app = FastAPI(title="xiaohongshu-tool", version="1.0.0")
+
+
+class ChallengeDetected(RuntimeError):
+    """页面进入滑块/验证码风控；由路由层统一返回结构化状态。"""
+
+    def __init__(self, result):
+        super().__init__(result["hint"])
+        self.result = result
+
+
+XHS_CHALLENGE_PATH_MARKERS = (
+    "/captcha", "/challenge", "/risk-control", "/security/verify",
+)
+XHS_CHALLENGE_SELECTORS = ", ".join((
+    'iframe[src*="captcha" i]',
+    'iframe[src*="challenge" i]',
+    'iframe[src*="verify" i]',
+    '.captcha-container',
+    '[class*="geetest" i]',
+    '[class*="yidun" i]',
+    '[class*="slide-verify" i]',
+    '[class*="slider-verify" i]',
+    '[id*="captcha" i]',
+))
+
+
+def _challenge_result(url):
+    return {
+        "ok": False,
+        "outcome": "challenge",
+        "status": "challenge",
+        "changed": False,
+        "retry_safe": False,
+        "platform": "xiaohongshu",
+        "url": url,
+        "hint": "检测到小红书滑块/验证码，请用手机接管 browser-relay 完成验证后再试",
+    }
+
+
+async def _raise_if_challenge(page):
+    path = urlparse(page.url or "").path.lower()
+    if any(marker in path for marker in XHS_CHALLENGE_PATH_MARKERS):
+        raise ChallengeDetected(_challenge_result(page.url))
+    try:
+        matches = page.locator(XHS_CHALLENGE_SELECTORS)
+        for index in range(min(await matches.count(), 5)):
+            if await matches.nth(index).is_visible():
+                raise ChallengeDetected(_challenge_result(page.url))
+    except ChallengeDetected:
+        raise
+    except Exception:
+        return
+
+
+async def _guarded_click(page, locator, **kwargs):
+    await _raise_if_challenge(page)
+    await locator.click(**kwargs)
+    await _raise_if_challenge(page)
+
+
+async def _human_type(page, text):
+    for char in text:
+        delay = random.randint(20, 80)
+        if char.isascii():
+            await page.keyboard.type(char, delay=delay)
+        else:
+            await page.keyboard.insert_text(char)
+            await asyncio.sleep(delay / 1000)
+        if char in "，。！？,.!?\n" or random.random() < 0.06:
+            await asyncio.sleep(random.uniform(0.12, 0.36))
 
 
 def _bounded_int(value, default, maximum):
@@ -205,6 +280,90 @@ async def new_work_page(context):
     return page
 
 
+def _browse_session_alive(session):
+    if not session or time.time() - session["last_active_at"] > BROWSE_TTL_SECONDS:
+        return False
+    page = session.get("page")
+    return bool(page and not page.is_closed())
+
+
+async def _close_browse_session(reason):
+    """只关闭 wrapper 自己为最近列表保留的后台页。"""
+    global _browse_session
+    session, _browse_session = _browse_session, None
+    if not session:
+        return
+    page = session.get("page")
+    if page is not None and not page.is_closed():
+        with suppress(Exception):
+            await asyncio.wait_for(page.close(), timeout=5)
+
+
+def _install_browse_session(page, items, source):
+    global _browse_session
+    ids = {item.get("id") for item in items if item.get("id")}
+    _browse_session = {
+        "page": page,
+        "ids": ids,
+        "source": source,
+        "list_url": page.url,
+        "last_active_at": time.time(),
+    }
+
+
+async def _find_note_cover(page, note_id):
+    """用真实滚轮寻找对应卡片，返回可点击的封面链接。"""
+    for step in range(12):
+        cards = page.locator(f'section.note-item[data-note-id="{note_id}"]')
+        for index in range(await cards.count()):
+            cover = cards.nth(index).locator("a.cover[href]").first
+            if await cover.count() and await cover.is_visible():
+                await cover.scroll_into_view_if_needed()
+                return cover
+        if step == 0:
+            await page.keyboard.press("Home")
+        else:
+            await page.mouse.wheel(0, random.randint(750, 1150))
+        await page.wait_for_timeout(random.randint(220, 520))
+        await _raise_if_challenge(page)
+    return None
+
+
+async def _xhs_detail_visible(page):
+    selectors = (
+        "#noteContainer:visible, .note-detail-mask:visible, "
+        ".note-detail:visible, #detail-title:visible, #detail-desc:visible"
+    )
+    return await page.locator(selectors).count() > 0
+
+
+async def _restore_xhs_list(page):
+    """优先按 Escape 关闭详情浮层；若是整页路由，再模拟浏览器后退。"""
+    try:
+        await page.keyboard.press("Escape")
+        for _ in range(10):
+            if (await page.locator("section.note-item[data-note-id]:visible").count()
+                    and not await _xhs_detail_visible(page)):
+                return True
+            await page.wait_for_timeout(250)
+        await page.keyboard.press("Alt+ArrowLeft")
+        for _ in range(10):
+            if (await page.locator("section.note-item[data-note-id]:visible").count()
+                    and not await _xhs_detail_visible(page)):
+                return True
+            await page.wait_for_timeout(250)
+        try:
+            await page.go_back(wait_until="commit", timeout=12000)
+        except PWTimeout:
+            pass
+        await page.wait_for_selector(
+            "section.note-item[data-note-id]:visible", timeout=12000
+        )
+        return not await _xhs_detail_visible(page)
+    except Exception:
+        return False
+
+
 async def _login_error(page):
     """仅在内容没加载时判断登录态，避免把页面上的普通“登录”字样当掉线。"""
     if "/login" in page.url:
@@ -266,10 +425,13 @@ CARD_EXTRACT_JS = r"""
 
 
 async def _wait_for_cards(page):
+    await _raise_if_challenge(page)
     try:
         await page.wait_for_selector("section.note-item[data-note-id]", timeout=18000)
+        await _raise_if_challenge(page)
         return None
     except PWTimeout:
+        await _raise_if_challenge(page)
         login = await _login_error(page)
         if login:
             return login
@@ -287,15 +449,28 @@ async def _collect_cards(page, n):
     seen = set()
     result = []
     for _ in range(8):
-        for item in await page.evaluate(CARD_EXTRACT_JS):
+        await _raise_if_challenge(page)
+        batch = await page.evaluate(CARD_EXTRACT_JS)
+        for item in batch:
             key = item.get("id")
             if key and key not in seen:
                 seen.add(key)
                 result.append(item)
         if len(result) >= n:
             break
-        await page.evaluate("window.scrollBy(0, Math.max(innerHeight * 0.85, 900))")
-        await page.wait_for_timeout(900)
+        before_ids = [item.get("id") for item in batch if item.get("id")]
+        await page.mouse.wheel(0, random.randint(850, 1250))
+        try:
+            await page.wait_for_function(
+                """(before) => [...document.querySelectorAll(
+                  'section.note-item[data-note-id]'
+                )].some(card => !before.includes(card.dataset.noteId))""",
+                arg=before_ids,
+                timeout=5000,
+            )
+        except PWTimeout:
+            await _raise_if_challenge(page)
+            await page.wait_for_timeout(random.randint(260, 680))
     return result[:n]
 
 
@@ -303,7 +478,9 @@ async def _goto(page, url):
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     except PWTimeout as exc:
+        await _raise_if_challenge(page)
         raise RuntimeError("打开小红书页面超时") from exc
+    await _raise_if_challenge(page)
 
 
 async def action_feed(page, body):
@@ -326,8 +503,28 @@ async def action_search(page, body):
     if len(query) > 100:
         return {"ok": False, "error": "query 最长 100 个字符"}
     n = _bounded_int(body.get("n"), 10, MAX_ITEMS)
-    url = f"{BASE}/search_result?keyword={quote(query)}&source=web_search_result_notes"
-    await _goto(page, url)
+    await _goto(page, f"{BASE}/explore")
+    search_input = page.locator('textarea#search-input-in-feeds:visible').first
+    try:
+        await search_input.wait_for(timeout=10000)
+    except PWTimeout:
+        # 旧版布局没有 feeds 专用 id，退回最后一个可见搜索编辑器。
+        search_input = page.locator(
+            'textarea[name="aiSearchTextarea"]:visible, '
+            'input[placeholder*="搜索"]:visible'
+        ).last
+        await search_input.wait_for(timeout=5000)
+    await _guarded_click(page, search_input)
+    await _human_type(page, query)
+    await page.keyboard.press("Enter")
+    try:
+        await page.wait_for_url(
+            re.compile(r"/search_result(?:_ai)?(?:\?|$)"), timeout=18000
+        )
+    except PWTimeout:
+        await _raise_if_challenge(page)
+        raise RuntimeError("点击搜索后没有进入结果页，小红书搜索入口可能已变化")
+    await _raise_if_challenge(page)
     error = await _wait_for_cards(page)
     if error == "EMPTY":
         return {
@@ -387,7 +584,9 @@ async def action_profile(page, body):
     await _goto(page, url)
     try:
         await page.wait_for_selector(".user-info, #userPageContainer", timeout=18000)
+        await _raise_if_challenge(page)
     except PWTimeout:
+        await _raise_if_challenge(page)
         login = await _login_error(page)
         return {
             "ok": False,
@@ -412,7 +611,112 @@ async def action_profile(page, body):
     }
 
 
-DETAIL_EXTRACT_JS = r"""
+DOM_DETAIL_EXTRACT_JS = r"""
+(noteId) => {
+  const visible = (element) => {
+    if (!element) return false;
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden'
+      && Number(style.opacity || 1) !== 0 && rect.width > 0 && rect.height > 0;
+  };
+  const roots = [...document.querySelectorAll(
+    '#noteContainer, .note-detail-mask, .note-detail, .note-content'
+  )].filter(visible);
+  const root = roots.reverse().find(element => element.querySelector(
+    '#detail-title, #detail-desc, .author-wrapper, .author-container'
+  )) || document;
+  const query = (selector) => root.querySelector(selector);
+  const queryAll = (selector) => root.querySelectorAll(selector);
+  const text = (selector) => query(selector)?.textContent?.trim() || '';
+  const absolute = (value) => {
+    try { return value ? new URL(value, location.origin).href : null; }
+    catch (_) { return null; }
+  };
+  const userLink = query(
+    '.author-wrapper a[href*="/user/profile/"], .author-container a[href*="/user/profile/"]'
+  );
+  const userHref = userLink?.getAttribute('href') || null;
+  const userId = userHref?.match(/\/user\/profile\/([0-9a-f]{24})/i)?.[1] || null;
+  const avatar = query(
+    '.author-wrapper img, .author-container img, .user-info img'
+  );
+
+  const imageNodes = [...queryAll(
+    '.swiper-slide img, .note-slider img, .slider-container img, '
+    + '.media-container img, [class*="carousel"] img'
+  )];
+  const seenImages = new Set();
+  const images = [];
+  for (const node of imageNodes) {
+    const url = node.currentSrc || node.src || node.getAttribute('data-src');
+    if (!url || seenImages.has(url)) continue;
+    seenImages.add(url);
+    images.push({
+      index: images.length,
+      url,
+      width: node.naturalWidth || null,
+      height: node.naturalHeight || null,
+      live_photo: false,
+    });
+  }
+
+  const tags = [...queryAll(
+    '#detail-desc a[href*="search_result"], .note-text a[href*="search_result"]'
+  )].map(link => ({
+    id: null,
+    name: link.textContent.trim().replace(/^#/, ''),
+    type: null,
+  })).filter(tag => tag.name);
+
+  const count = (selector) => {
+    const value = text(selector);
+    return value || null;
+  };
+  const title = text('#detail-title, .note-content .title, .note-detail .title');
+  const description = text('#detail-desc, .note-content .desc, .note-detail .desc');
+  const hasVideo = Boolean(query('video, .player-container'));
+  const rootVisible = root !== document || Boolean(query('.note-content'));
+
+  return {
+    found: Boolean(rootVisible && (title || description || images.length || hasVideo)),
+    note: {
+      id: noteId || null,
+      type: hasVideo ? 'video' : (images.length ? 'normal' : null),
+      title,
+      description,
+      author: userLink ? {
+        user_id: userId,
+        nickname: userLink.textContent.trim(),
+        avatar: avatar ? (avatar.currentSrc || avatar.src) : null,
+        url: absolute(userHref),
+      } : null,
+      created_at: text('.date, .publish-time, [class*="publish-time"]') || null,
+      updated_at: null,
+      ip_location: text('.location, .ip-location, [class*="ip-location"]') || null,
+      tags,
+      images,
+      stats: {
+        likes: count('.like-wrapper .count, [data-testid="like"] .count'),
+        collected: count('.collect-wrapper .count, [data-testid="collect"] .count'),
+        comments: count('.chat-wrapper .count, .comment-wrapper .count'),
+        shares: count('.share-wrapper .count'),
+      },
+      viewer_state: {
+        liked: Boolean(query('.like-wrapper.active, .like-wrapper.liked')),
+        collected: Boolean(query('.collect-wrapper.active, .collect-wrapper.collected')),
+        followed_author: Boolean(query('.follow-button.followed, .followed')),
+      },
+    },
+    comments: [],
+    comments_cursor: null,
+    comments_has_more: false,
+  };
+}
+"""
+
+
+STORE_DETAIL_EXTRACT_JS = r"""
 (noteId) => {
   const unwrap = (value) => {
     if (!value || typeof value !== 'object') return value;
@@ -508,7 +812,19 @@ DETAIL_EXTRACT_JS = r"""
 
 
 DOM_COMMENT_EXTRACT_JS = r"""
-() => [...document.querySelectorAll('.comment-item:not(.comment-item-sub)')].map(item => {
+() => {
+  const visible = (element) => {
+    if (!element) return false;
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden'
+      && Number(style.opacity || 1) !== 0 && rect.width > 0 && rect.height > 0;
+  };
+  const roots = [...document.querySelectorAll(
+    '#noteContainer, .note-detail-mask, .note-detail, .note-content'
+  )].filter(visible);
+  const root = roots.reverse().find(element => element.querySelector('.comment-item')) || document;
+  return [...root.querySelectorAll('.comment-item:not(.comment-item-sub)')].map(item => {
   const text = (selector) => item.querySelector(selector)?.textContent?.trim() || '';
   const userLink = item.querySelector('.author-wrapper .author a.name[href], .author a.name[href]');
   const href = userLink?.href || null;
@@ -524,11 +840,34 @@ DOM_COMMENT_EXTRACT_JS = r"""
     pictures: image ? [image.currentSrc || image.src] : [],
     sub_comments: [],
   };
-})
+  });
+}
 """
 
 
-async def action_read(page, body):
+def _fill_missing(primary, fallback):
+    """DOM 为主；只用页面状态补 DOM 未渲染出的字段。"""
+    if isinstance(primary, dict) and isinstance(fallback, dict):
+        merged = dict(primary)
+        for key, value in fallback.items():
+            if key in merged:
+                merged[key] = _fill_missing(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+    if primary is None or primary == "" or primary == [] or primary == {}:
+        return fallback
+    return primary
+
+
+def _dom_detail_needs_fallback(detail, comments):
+    note = detail.get("note") or {}
+    has_body = bool(note.get("title") or note.get("description"))
+    has_media = bool(note.get("images") or note.get("type") == "video")
+    return not detail.get("found") or not has_body or not has_media or not comments
+
+
+async def action_read(page, body, from_list=False):
     try:
         raw = await _resolve_short_link(body.get("url"))
         url = _safe_xhs_url(raw, "note")
@@ -539,36 +878,84 @@ async def action_read(page, body):
         return {"ok": False, "error": "URL 中没有可识别的 24 位笔记 ID"}
 
     n = _bounded_int(body.get("n"), 10, MAX_COMMENTS)
-    await _goto(page, url)
+    opened_from_list = False
+    if from_list:
+        cover = await _find_note_cover(page, note_id)
+        if cover is None:
+            await _close_browse_session("card_not_found")
+            return {
+                "ok": False,
+                "error": "命中刚才的 feed，但在渲染列表里找不到对应笔记卡片；为避免硬跳 URL，未自动降级",
+                "navigation": "card_click_failed",
+            }
+        await _guarded_click(page, cover)
+        opened_from_list = True
+    else:
+        await _goto(page, url)
+
+    restored = False
     try:
-        await page.wait_for_function(
-            """(id) => Boolean(
-              document.querySelector('#detail-title, #detail-desc') ||
-              window.__INITIAL_STATE__?.note?.noteDetailMap?.[id]
-            )""",
-            arg=note_id,
-            timeout=20000,
+        try:
+            await page.wait_for_function(
+                """(id) => Boolean(
+                  location.pathname.includes(id) && (
+                    [...document.querySelectorAll('#detail-title, #detail-desc')].some(el => {
+                      const style = getComputedStyle(el);
+                      const rect = el.getBoundingClientRect();
+                      return style.display !== 'none' && style.visibility !== 'hidden'
+                        && rect.width > 0 && rect.height > 0;
+                    }) || window.__INITIAL_STATE__?.note?.noteDetailMap?.[id]
+                  )
+                )""",
+                arg=note_id,
+                timeout=20000,
+            )
+            await _raise_if_challenge(page)
+        except PWTimeout:
+            await _raise_if_challenge(page)
+            login = await _login_error(page)
+            result = {
+                "ok": False,
+                "error": login or "等待笔记详情超时：链接可能缺少有效 xsec_token，或页面结构已变化",
+            }
+        else:
+            # 先读已经渲染出来的 DOM；只有关键字段或评论缺失时才碰页面内部状态。
+            detail = await page.evaluate(DOM_DETAIL_EXTRACT_JS, note_id)
+            comments = await page.evaluate(DOM_COMMENT_EXTRACT_JS)
+            extraction_source = "dom"
+            if _dom_detail_needs_fallback(detail, comments):
+                fallback = await page.evaluate(STORE_DETAIL_EXTRACT_JS, note_id)
+                detail = _fill_missing(detail, fallback)
+                detail["found"] = bool(detail.get("found") or fallback.get("found"))
+                if not comments:
+                    comments = fallback.get("comments") or []
+                extraction_source = "dom+store_fallback"
+
+            if not detail.get("found"):
+                result = {"ok": False, "error": "笔记详情没有加载出来，链接可能已失效或无权限"}
+            else:
+                detail["comments"] = comments[:n]
+                detail["extraction_source"] = extraction_source
+                detail["source_url"] = page.url
+                detail["action"] = "read"
+                detail["ok"] = True
+                detail.pop("found", None)
+                result = detail
+        result["navigation"] = (
+            "feed_card_click" if from_list else "direct_url_fallback"
         )
-    except PWTimeout:
-        login = await _login_error(page)
-        return {
-            "ok": False,
-            "error": login or "等待笔记详情超时：链接可能缺少有效 xsec_token，或页面结构已变化",
-        }
+    finally:
+        if opened_from_list:
+            restored = await _restore_xhs_list(page)
+            if (_browse_session and _browse_session.get("page") is page
+                    and restored):
+                _browse_session["last_active_at"] = time.time()
+            elif _browse_session and _browse_session.get("page") is page:
+                await _close_browse_session("list_restore_failed")
 
-    detail = await page.evaluate(DETAIL_EXTRACT_JS, note_id)
-    if not detail.get("found"):
-        return {"ok": False, "error": "笔记详情没有加载出来，链接可能已失效或无权限"}
-
-    comments = detail.get("comments") or []
-    if not comments:
-        comments = await page.evaluate(DOM_COMMENT_EXTRACT_JS)
-    detail["comments"] = comments[:n]
-    detail["source_url"] = page.url
-    detail["action"] = "read"
-    detail["ok"] = True
-    detail.pop("found", None)
-    return detail
+    if opened_from_list and not restored:
+        result["browse_session_warning"] = "详情已读取，但返回 feed 失败；下一次 read 将走外部链接兜底"
+    return result
 
 
 ACTIONS = {
@@ -589,6 +976,8 @@ async def health():
             "contexts": len(_browser.contexts),
             "existing_tabs": len(context.pages),
             "read_only_actions": sorted(ACTIONS),
+            "browse_session": bool(_browse_session_alive(_browse_session)),
+            "browse_ttl_seconds": BROWSE_TTL_SECONDS,
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
@@ -613,24 +1002,79 @@ async def xiaohongshu(request: Request):
 
     async with ACTION_LOCK:
         page = None
+        keep_page = False
         try:
+            if _browse_session and not _browse_session_alive(_browse_session):
+                await _close_browse_session("expired_before_action")
+            if action in {"feed", "search", "profile"}:
+                await _close_browse_session("replaced_by_list_action")
+
             context = await get_context()
-            page = await new_work_page(context)
-            return await ACTIONS[action](page, body)
+            raw_read_url = body.get("url")
+            note_id = (
+                _note_id_from_url(raw_read_url)
+                if action == "read" and isinstance(raw_read_url, str)
+                else None
+            )
+            use_cached_list = bool(
+                action == "read"
+                and _browse_session_alive(_browse_session)
+                and note_id in _browse_session["ids"]
+            )
+            if use_cached_list:
+                page = _browse_session["page"]
+                keep_page = True
+                result = await action_read(page, body, from_list=True)
+            else:
+                page = await new_work_page(context)
+                result = await ACTIONS[action](page, body)
+
+            if action in {"feed", "search", "profile"} and result.get("ok"):
+                items = result.get("items") or []
+                if items:
+                    _install_browse_session(page, items, action)
+                    keep_page = True
+                    result["read_navigation"] = "card_click_available"
+            return result
         except asyncio.CancelledError:
             raise
+        except ChallengeDetected as exc:
+            if _browse_session and _browse_session.get("page") is page:
+                await _close_browse_session("challenge")
+                keep_page = False
+            return exc.result
         except Exception as exc:
             return {"ok": False, "error": f"{action} 失败：{exc}"}
         finally:
-            if page is not None:
+            if page is not None and not keep_page and not page.is_closed():
                 with suppress(Exception):
                     await asyncio.wait_for(page.close(), timeout=5)
+
+
+async def _session_sweeper():
+    while True:
+        await asyncio.sleep(30)
+        async with ACTION_LOCK:
+            if _browse_session and not _browse_session_alive(_browse_session):
+                await _close_browse_session("expired")
+
+
+@app.on_event("startup")
+async def startup():
+    global _sweeper_task
+    _sweeper_task = asyncio.create_task(_session_sweeper())
 
 
 @app.on_event("shutdown")
 async def shutdown():
     """只断开 Playwright 控制连接，绝不关闭常驻 Chrome。"""
-    global _pw, _browser
+    global _pw, _browser, _sweeper_task
+    if _sweeper_task is not None:
+        _sweeper_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _sweeper_task
+        _sweeper_task = None
+    await _close_browse_session("service_shutdown")
     _browser = None
     if _pw is not None:
         with suppress(Exception):

@@ -24,13 +24,15 @@ import hmac
 import json
 import math
 import os
+import random
 import re
 import time
 import unicodedata
 from collections import deque
+from contextlib import suppress
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -63,6 +65,7 @@ _idempotency = {}  # key -> {fingerprint,status,result,created_at,updated_at}
 READ_SEM = asyncio.Semaphore(2)  # 读操作自身上限；读写还会共同占用 PAGE_CAPACITY
 WRITE_LOCK = asyncio.Lock()
 PAGE_CAPACITY = asyncio.Semaphore(2)  # 读写共用：工具自己的 x.com 工作页总数最多 2
+BROWSE_TTL_SECONDS = max(30, int(os.environ.get("TW_BROWSE_TTL_SECONDS", "180")))
 
 _pw = None
 _browser = None
@@ -75,6 +78,9 @@ _state_healthy = False
 _state_health_error = "运行状态尚未加载"
 _write_click_attempted = contextvars.ContextVar(
     "twitter_write_click_attempted", default=None)
+_browse_session = None  # 最近一次列表页；feed/profile -> read 时复用并点击真实卡片
+_browse_lock = asyncio.Lock()
+_sweeper_task = None
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -148,6 +154,78 @@ def _request_guard(req, *, require_json=False):
         if media_type != "application/json":
             return _guard_error(415, "Content-Type 必须是 application/json")
     return None
+
+
+class ChallengeDetected(RuntimeError):
+    """页面进入平台风控挑战；由路由层统一转成结构化结果。"""
+
+    def __init__(self, result):
+        super().__init__(result["hint"])
+        self.result = result
+
+
+TW_CHALLENGE_URL_MARKERS = (
+    "arkoselabs", "/i/flow/challenge", "/account/access", "challenge_id=",
+)
+TW_CHALLENGE_SELECTORS = ", ".join((
+    'iframe[src*="arkose" i]',
+    'iframe[src*="arkoselabs" i]',
+    'iframe[id*="arkose" i]',
+    'iframe[data-testid*="arkose" i]',
+    'input[name*="arkose" i]',
+    '[data-testid="arkoseFrame"]',
+))
+
+
+def _challenge_result(url):
+    return {
+        "ok": False,
+        "outcome": "challenge",
+        "status": "challenge",
+        "changed": False,
+        "retry_safe": False,
+        "manual_intervention_required": True,
+        "platform": "twitter",
+        "url": url,
+        "hint": "检测到 X 人机验证，请用手机接管 browser-relay 完成验证后再试",
+    }
+
+
+async def _raise_if_challenge(page):
+    """只识别强特征，识别不到时保持原有超时/失败路径。"""
+    page_url = getattr(page, "url", "") or ""
+    url = page_url.lower()
+    if any(marker in url for marker in TW_CHALLENGE_URL_MARKERS):
+        raise ChallengeDetected(_challenge_result(page_url))
+    try:
+        matches = page.locator(TW_CHALLENGE_SELECTORS)
+        for index in range(min(await matches.count(), 4)):
+            if await matches.nth(index).is_visible():
+                raise ChallengeDetected(_challenge_result(page_url))
+    except ChallengeDetected:
+        raise
+    except Exception:
+        # 检测器本身不能盖掉旧路径。
+        return
+
+
+async def _guarded_click(page, locator, **kwargs):
+    await _raise_if_challenge(page)
+    await locator.click(**kwargs)
+    await _raise_if_challenge(page)
+
+
+async def _human_type(page, text):
+    """逐字输入；节奏有抖动并偶尔停顿，不再固定 15ms。"""
+    for char in text:
+        delay = random.randint(20, 80)
+        if char.isascii():
+            await page.keyboard.type(char, delay=delay)
+        else:
+            await page.keyboard.insert_text(char)
+            await asyncio.sleep(delay / 1000)
+        if char in "，。！？,.!?\n" or random.random() < 0.06:
+            await asyncio.sleep(random.uniform(0.12, 0.36))
 
 
 def _now_cn():
@@ -466,6 +544,20 @@ async def _find_page_by_target_id(ctx, target_id, timeout=5.0):
     raise RuntimeError(f"创建 target {target_id} 后找不到对应 Page，拒绝接管其他标签页")
 
 
+async def _configure_page_resources(page, block_images):
+    """切换工作页资源策略；列表页点进详情时需要重新放行图片。"""
+    await page.unroute("**/*")
+    blocked = ("image", "media", "font") if block_images else ("media", "font")
+
+    async def _block_heavy(route):
+        if route.request.resource_type in blocked:
+            await route.abort()
+        else:
+            await route.continue_()
+
+    await page.route("**/*", _block_heavy)
+
+
 async def new_page(ctx, block_images=True):
     """开后台标签页干活，尽量不抢中继浏览器当前焦点。
 
@@ -499,16 +591,8 @@ async def new_page(ctx, block_images=True):
         await page.set_viewport_size({"width": 1100, "height": 1300})
         page.set_default_timeout(15000)
 
-        # 不真的下载图片/视频/字体——图片链接从 DOM 属性抓，省内存带宽
-        blocked = ("image", "media", "font") if block_images else ("media", "font")
-
-        async def _block_heavy(route):
-            if route.request.resource_type in blocked:
-                await route.abort()
-            else:
-                await route.continue_()
-
-        await page.route("**/*", _block_heavy)
+        # 列表页默认省流；点进详情时会在同一页重新放行图片。
+        await _configure_page_resources(page, block_images)
         return page
     except BaseException:
         if page is not None and id(page) in _owned_pages:
@@ -597,6 +681,108 @@ async def _close_owned_page(page):
     except asyncio.CancelledError:
         # 外层 150s 超时可以返回；shield 内的 close 仍会跑完并释放容量。
         raise
+
+
+def _browse_session_alive(session):
+    if not session or time.time() - session["last_active_at"] > BROWSE_TTL_SECONDS:
+        return False
+    page = session.get("page")
+    return bool(page and not page.is_closed() and id(page) in _owned_pages)
+
+
+async def _drop_browse_session_locked(reason):
+    """调用方须持有 _browse_lock；只关闭 wrapper 自己登记的列表页。"""
+    global _browse_session
+    session, _browse_session = _browse_session, None
+    if not session:
+        return
+    page = session.get("page")
+    if page is not None and not page.is_closed():
+        await _close_owned_page(page)
+    log_action({"action": "_browse_session_closed", "reason": reason})
+
+
+async def _expire_browse_session():
+    async with _browse_lock:
+        if _browse_session and not _browse_session_alive(_browse_session):
+            await _drop_browse_session_locked("expired")
+
+
+def _install_browse_session(page, items, source):
+    global _browse_session
+    ids = {_status_id(item.get("url")) for item in items}
+    _browse_session = {
+        "page": page,
+        "ids": {sid for sid in ids if sid},
+        "source": source,
+        "list_url": page.url,
+        "last_active_at": time.time(),
+    }
+    _touch_owned_page(page)
+
+
+async def _find_tweet_link(page, sid):
+    """只点击外层推文自己的永久链接；引用卡片里的同号链接不算。"""
+    for step in range(12):
+        articles = page.locator('article[data-testid="tweet"]')
+        for article_index in range(await articles.count()):
+            article = articles.nth(article_index)
+            try:
+                own_href = await article.evaluate(OWN_STATUS_HREF_JS)
+            except Exception:
+                continue
+            if _status_id(own_href) != sid:
+                continue
+            own_path = urlsplit(urljoin(BASE, own_href or "")).path.rstrip("/").lower()
+            links = article.locator("a:has(time)")
+            for link_index in range(await links.count()):
+                link = links.nth(link_index)
+                try:
+                    href = await link.evaluate("a => a.href")
+                    link_path = urlsplit(urljoin(BASE, href or "")).path.rstrip("/").lower()
+                    visible = await link.is_visible()
+                except Exception:
+                    continue
+                if link_path == own_path and visible:
+                    await link.scroll_into_view_if_needed()
+                    return link
+        if step == 0:
+            await page.keyboard.press("Home")
+        else:
+            await page.mouse.wheel(0, random.randint(900, 1450))
+        await page.wait_for_timeout(random.randint(220, 520))
+        await _raise_if_challenge(page)
+    return None
+
+
+async def _restore_twitter_list(page, sid):
+    """详情读完后模拟浏览器后退，保留列表页供同一批下一次 read。"""
+    try:
+        await page.keyboard.press("Alt+ArrowLeft")
+        try:
+            await page.wait_for_function(
+                "sid => !location.pathname.includes('/status/' + sid)",
+                arg=sid,
+                timeout=2500,
+            )
+        except PWTimeout:
+            # 渲染进程里的按键不一定触发 Chrome 外壳快捷键；走浏览器历史，
+            # 仍然不构造/跳转 URL。
+            try:
+                await page.go_back(wait_until="commit", timeout=12000)
+            except PWTimeout:
+                # SPA/bfcache 可能已回退却不发新的 load 事件，以实际页面状态为准。
+                pass
+            await page.wait_for_function(
+                "sid => !location.pathname.includes('/status/' + sid)",
+                arg=sid,
+                timeout=12000,
+            )
+        return await wait_tweets(page) is None
+    except ChallengeDetected:
+        raise
+    except Exception:
+        return False
 
 
 # ---------- 页面解析 ----------
@@ -746,10 +932,13 @@ async def _read_current_actor(page):
 
 async def wait_tweets(page):
     """等推文出现；区分「没登录」「空结果」「真超时」。"""
+    await _raise_if_challenge(page)
     try:
         await page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
+        await _raise_if_challenge(page)
         return None
     except PWTimeout:
+        await _raise_if_challenge(page)
         if not await check_logged_in(page):
             return "登录态失效：中继浏览器里推特掉登录了，需要重新登录"
         if await page.query_selector('[data-testid="empty_state_header_text"]'):
@@ -762,6 +951,7 @@ async def wait_tweets(page):
 async def collect_tweets(page, n):
     seen, result = set(), []
     for _ in range(10):
+        await _raise_if_challenge(page)
         batch = await page.evaluate(EXTRACT_JS)
         for t in batch:
             key = t.get("url") or t.get("text", "")[:80]
@@ -770,15 +960,70 @@ async def collect_tweets(page, n):
                 result.append(t)
         if len(result) >= n:
             break
-        await page.mouse.wheel(0, 2600)
-        await page.wait_for_timeout(1200)
+        before_urls = [t.get("url") for t in batch if t.get("url")]
+        await page.mouse.wheel(0, random.randint(2200, 3000))
+        try:
+            await page.wait_for_function(
+                """(before) => [...document.querySelectorAll(
+                  'article[data-testid="tweet"] a[href*="/status/"]'
+                )].some(a => a.href && !before.includes(a.href))""",
+                arg=before_urls,
+                timeout=5500,
+            )
+        except PWTimeout:
+            await _raise_if_challenge(page)
+            await page.wait_for_timeout(random.randint(280, 720))
     return result[:n]
 
 
 async def goto(page, url):
     _touch_owned_page(page)
-    await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+    except PWTimeout:
+        await _raise_if_challenge(page)
+        raise
     _touch_owned_page(page)
+    await _raise_if_challenge(page)
+
+
+async def _open_search_via_ui(page, query, latest=False):
+    """从首页点搜索入口并真实输入，不直接拼 /search URL。"""
+    await goto(page, f"{BASE}/home")
+    search_link = page.locator(
+        '[data-testid="AppTabBar_Explore_Link"]:visible, a[href="/explore"]:visible'
+    ).first
+    await search_link.wait_for(timeout=12000)
+    await _guarded_click(page, search_link)
+
+    search_input = page.locator(
+        'input[data-testid="SearchBox_Search_Input"]:visible'
+    ).first
+    await search_input.wait_for(timeout=12000)
+    await _guarded_click(page, search_input)
+    await _human_type(page, query)
+    await page.keyboard.press("Enter")
+    try:
+        await page.wait_for_url(re.compile(r"/search(?:\?|$)"), timeout=15000)
+    except PWTimeout:
+        await _raise_if_challenge(page)
+        raise
+    await _raise_if_challenge(page)
+
+    if latest:
+        latest_tab = page.locator(
+            'a[href*="/search"][href*="f=live"]:visible'
+        ).first
+        try:
+            await latest_tab.wait_for(timeout=8000)
+            await _guarded_click(page, latest_tab)
+        except PWTimeout:
+            # X 偶尔先用 tab 角色渲染，不带 href。
+            latest_role = page.get_by_role(
+                "tab", name=re.compile(r"^(Latest|最新)$", re.I)
+            ).first
+            await latest_role.wait_for(timeout=5000)
+            await _guarded_click(page, latest_role)
 
 
 # ---------- 读动作 ----------
@@ -786,25 +1031,30 @@ async def goto(page, url):
 async def act_feed(ctx, body):
     n = min(int(body.get("n", 10)), 30)
     query = (body.get("query") or "").strip()
-    page = await new_page(ctx)
-    try:
-        if query:
-            url = f"{BASE}/search?q={quote(query)}&src=typed_query"
-            if body.get("latest"):
-                url += "&f=live"
-        else:
-            url = f"{BASE}/home"
-        await goto(page, url)
-        err = await wait_tweets(page)
-        if err == "EMPTY":
-            return {"ok": True, "tweets": [], "note": "搜索无结果"}
-        if err:
-            return {"ok": False, "error": err}
-        tweets = await collect_tweets(page, n)
-        return {"ok": True, "source": "search" if query else "home_timeline",
-                "tweets": tweets}
-    finally:
-        await _close_owned_page(page)
+    async with _browse_lock:
+        await _drop_browse_session_locked("replaced_by_feed")
+        page = await new_page(ctx)
+        keep_page = False
+        try:
+            if query:
+                await _open_search_via_ui(page, query, bool(body.get("latest")))
+            else:
+                await goto(page, f"{BASE}/home")
+            err = await wait_tweets(page)
+            if err == "EMPTY":
+                return {"ok": True, "tweets": [], "note": "搜索无结果"}
+            if err:
+                return {"ok": False, "error": err}
+            tweets = await collect_tweets(page, n)
+            source = "search" if query else "home_timeline"
+            if tweets:
+                _install_browse_session(page, tweets, source)
+                keep_page = True
+            return {"ok": True, "source": source, "tweets": tweets,
+                    "read_navigation": "card_click_available" if tweets else None}
+        finally:
+            if not keep_page:
+                await _close_owned_page(page)
 
 
 async def act_profile(ctx, body):
@@ -816,23 +1066,51 @@ async def act_profile(ctx, body):
         return {"ok": False, "error":
                 "缺参数 user，且默认主页还没配置（TW_DEFAULT_USER）"}
     n = min(int(body.get("n", 10)), 30)
-    page = await new_page(ctx)
-    try:
-        await goto(page, f"{BASE}/{quote(user)}")
-        if await page.query_selector('[data-testid="emptyState"]'):
-            return {"ok": False, "error": f"用户 @{user} 不存在或无内容"}
-        err = await wait_tweets(page)
-        if err == "EMPTY" or err is None:
-            tweets = await collect_tweets(page, n) if err is None else []
-            return {"ok": True, "user": user, "tweets": tweets}
-        return {"ok": False, "error": err}
-    finally:
-        await _close_owned_page(page)
+    async with _browse_lock:
+        await _drop_browse_session_locked("replaced_by_profile")
+        page = await new_page(ctx)
+        keep_page = False
+        try:
+            await goto(page, f"{BASE}/{quote(user)}")
+            if await page.query_selector('[data-testid="emptyState"]'):
+                return {"ok": False, "error": f"用户 @{user} 不存在或无内容"}
+            err = await wait_tweets(page)
+            if err == "EMPTY" or err is None:
+                tweets = await collect_tweets(page, n) if err is None else []
+                if tweets:
+                    _install_browse_session(page, tweets, "profile")
+                    keep_page = True
+                return {"ok": True, "user": user, "tweets": tweets,
+                        "read_navigation": "card_click_available" if tweets else None}
+            return {"ok": False, "error": err}
+        finally:
+            if not keep_page:
+                await _close_owned_page(page)
 
 
 def _status_id(url):
     m = re.search(r"/status/(\d+)", url or "")
     return m.group(1) if m else None
+
+
+async def _extract_tweet_detail(page, sid, n):
+    err = await wait_tweets(page)
+    if err:
+        return {"ok": False, "error": "推文不存在或已删除" if err == "EMPTY" else err}
+    tweets = await collect_tweets(page, n + 5)
+    main, above, replies = None, [], []
+    for tweet in tweets:
+        if main is None and _status_id(tweet.get("url")) == sid:
+            main = tweet
+        elif main is None:
+            above.append(tweet)
+        else:
+            replies.append(tweet)
+    if main is None:
+        return {"ok": False,
+                "error": "页面没有找到链接所指向的精确 status，拒绝拿别的推文代替"}
+    return {"ok": True, "tweet": main, "thread_above": above,
+            "replies": replies[:n]}
 
 
 async def act_read(ctx, body):
@@ -841,26 +1119,63 @@ async def act_read(ctx, body):
     if not sid:
         return {"ok": False, "error": "url 不像推文链接，要形如 https://x.com/xxx/status/123..."}
     n = min(int(body.get("n", 15)), 40)
+
+    # 命中最近一批列表结果时，必须从原卡片点击；定位失败不静默硬跳。
+    async with _browse_lock:
+        if _browse_session and not _browse_session_alive(_browse_session):
+            await _drop_browse_session_locked("expired_before_read")
+        session = _browse_session
+        if session and sid in session["ids"]:
+            page = session["page"]
+            restored = False
+            try:
+                await _configure_page_resources(page, block_images=False)
+                link = await _find_tweet_link(page, sid)
+                if link is None:
+                    await _drop_browse_session_locked("card_not_found")
+                    return {
+                        "ok": False,
+                        "error": "命中刚才的 feed，但在渲染列表里找不到对应推文卡片；为避免硬跳 URL，未自动降级",
+                        "navigation": "card_click_failed",
+                    }
+                await _guarded_click(page, link)
+                try:
+                    await page.wait_for_function(
+                        "sid => location.pathname.includes('/status/' + sid)",
+                        arg=sid,
+                        timeout=15000,
+                    )
+                except PWTimeout:
+                    await _raise_if_challenge(page)
+                    raise RuntimeError("点击推文卡片后没有进入详情页")
+                result = await _extract_tweet_detail(page, sid, n)
+                result["navigation"] = "feed_card_click"
+            finally:
+                if _browse_session is session:
+                    try:
+                        restored = await _restore_twitter_list(page, sid)
+                    except ChallengeDetected:
+                        with suppress(Exception):
+                            await _drop_browse_session_locked("challenge_during_restore")
+                        raise
+                    if restored:
+                        session["last_active_at"] = time.time()
+                        _touch_owned_page(page)
+                        with suppress(Exception):
+                            await _configure_page_resources(page, block_images=True)
+                    else:
+                        await _drop_browse_session_locked("list_restore_failed")
+            if not restored:
+                result["browse_session_warning"] = "详情已读取，但返回 feed 失败；下一次 read 将走外部链接兜底"
+            return result
+
+    # 外部空降链接、缓存过期或不属于最近列表：保留直接打开作为明确兜底。
     page = await new_page(ctx, block_images=False)
     try:
-        # 统一走 /i/status/<id>：twitter.com/vxtwitter/带?s=尾巴的分享链接都能开
         await goto(page, f"{BASE}/i/status/{sid}")
-        err = await wait_tweets(page)
-        if err:
-            return {"ok": False, "error": "推文不存在或已删除" if err == "EMPTY" else err}
-        tweets = await collect_tweets(page, n + 5)
-        main, above, replies = None, [], []
-        for t in tweets:
-            if main is None and _status_id(t.get("url")) == sid:
-                main = t
-            elif main is None:
-                above.append(t)
-            else:
-                replies.append(t)
-        if main is None:
-            return {"ok": False, "error": "页面没有找到链接所指向的精确 status，拒绝拿别的推文代替"}
-        return {"ok": True, "tweet": main, "thread_above": above,
-                "replies": replies[:n]}
+        result = await _extract_tweet_detail(page, sid, n)
+        result["navigation"] = "direct_url_fallback"
+        return result
     finally:
         await _close_owned_page(page)
 
@@ -1006,6 +1321,7 @@ async def _verify_expected_actor(ctx, expected_actor):
 
 async def _click_with_x_response(page, click, markers):
     """先挂网络监听再点击；没抓到响应时不能把“可能已执行”误报成失败。"""
+    await _raise_if_challenge(page)
     try:
         async with page.expect_response(
                 lambda response: any(marker in response.url for marker in markers),
@@ -1026,6 +1342,7 @@ async def _click_with_x_response(page, click, markers):
                 tracker["rate_recorded"] = True
                 tracker["attempted"] = True
             await click()
+        await _raise_if_challenge(page)
         response = await response_info.value
         try:
             payload = await response.json()
@@ -1038,6 +1355,7 @@ async def _click_with_x_response(page, click, markers):
             "payload": payload,
         }
     except PWTimeout:
+        await _raise_if_challenge(page)
         return {"captured": False}
 
 
@@ -1261,7 +1579,7 @@ async def act_repost(ctx, body):
                 return _target_result(
                     _confirmed("本来就已转发", changed=False), target_handle)
             return _target_result(_failed("找不到转发按钮"), target_handle)
-        await btn.first.click()
+        await _guarded_click(page, btn.first)
         confirm = page.locator('[data-testid="retweetConfirm"]')
         network = await _click_with_x_response(
             page, lambda: confirm.click(timeout=6000), ["CreateRetweet"])
@@ -1292,8 +1610,9 @@ async def act_repost(ctx, body):
 
 async def _type_and_send(page, text, button_tid):
     box = page.locator('[data-testid="tweetTextarea_0"]')
-    await box.first.click(timeout=10000)
-    await page.keyboard.type(text, delay=15)
+    await _guarded_click(page, box.first, timeout=10000)
+    await _human_type(page, text)
+    await _raise_if_challenge(page)
     btn = page.locator(f'button[data-testid="{button_tid}"]')
     await btn.first.wait_for(timeout=6000)
     if await btn.first.is_disabled():
@@ -1343,9 +1662,18 @@ async def act_post(ctx, body):
         return _failed("缺参数 text")
     page = await new_page(ctx)
     try:
-        await goto(page, f"{BASE}/compose/post")
+        await goto(page, f"{BASE}/home")
         if not await check_logged_in(page):
             return _failed("登录态失效")
+        compose = page.locator(
+            '[data-testid="SideNav_NewTweet_Button"]:visible, '
+            'a[href="/compose/post"]:visible'
+        ).first
+        await compose.wait_for(timeout=12000)
+        await _guarded_click(page, compose)
+        await page.locator('[data-testid="tweetTextarea_0"]').first.wait_for(
+            timeout=12000
+        )
         sent = await _type_and_send(page, text, "tweetButton")
         if sent.get("error"):
             return _failed(sent["error"])
@@ -1402,6 +1730,7 @@ def _downgrade_for_infra(result, message, *, attempted):
 async def _tab_sweeper():
     while True:
         await asyncio.sleep(60)
+        await _expire_browse_session()
         closed = await _sweep_owned_orphans()
         if closed:
             log_action({"action": "_sweep_owned_orphans", "closed": closed})
@@ -1409,11 +1738,33 @@ async def _tab_sweeper():
 
 @app.on_event("startup")
 async def _start_sweeper():
+    global _sweeper_task
     _load_state()
     closed = await _sweep_owned_orphans()
     if closed:
         log_action({"action": "_startup_sweep_owned_orphans", "closed": closed})
-    asyncio.create_task(_tab_sweeper())
+    _sweeper_task = asyncio.create_task(_tab_sweeper())
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    """先关短时列表页，再断 Playwright；不关闭常驻 Chrome 或人工标签页。"""
+    global _pw, _browser, _sweeper_task
+    if _sweeper_task is not None:
+        _sweeper_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _sweeper_task
+        _sweeper_task = None
+    async with _browse_lock:
+        await _drop_browse_session_locked("service_shutdown")
+    for task in list(_cleanup_tasks):
+        with suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=12)
+    _browser = None
+    if _pw is not None:
+        with suppress(Exception):
+            await asyncio.wait_for(_pw.stop(), timeout=5)
+        _pw = None
 
 
 @app.get("/health")
@@ -1437,7 +1788,9 @@ async def health(req: Request):
         ctx = await asyncio.wait_for(get_context(), timeout=45)
         return {"ok": True, **base, "tabs": len(ctx.pages),
                 "owned_pages": len(_owned_pages),
-                "tracked_orphans": len(_owned_targets) - len(_owned_pages)}
+                "tracked_orphans": len(_owned_targets) - len(_owned_pages),
+                "browse_session": bool(_browse_session_alive(_browse_session)),
+                "browse_ttl_seconds": BROWSE_TTL_SECONDS}
     except asyncio.TimeoutError:
         return {"ok": False, **base, "error": "连中继浏览器超时（含自愈重试仍失败）"}
     except Exception as e:
@@ -1464,6 +1817,8 @@ async def twitter(req: Request):
                 ctx = await get_context()
                 return await asyncio.wait_for(
                     READ_ACTIONS[action](ctx, body), timeout=150)
+            except ChallengeDetected as exc:
+                return exc.result
             except asyncio.TimeoutError:
                 return {"ok": False, "error": "动作整体超时（150秒），浏览器可能卡住了"}
             except Exception as e:
@@ -1495,6 +1850,19 @@ async def twitter(req: Request):
                 result, actual_actor = await asyncio.wait_for(
                     _execute_write(action, body, expected_actor),
                     timeout=WRITE_TIMEOUT_SECONDS)
+            except ChallengeDetected as exc:
+                challenge = exc.result
+                if tracker["attempted"]:
+                    result = _uncertain(
+                        challenge["hint"] + "；写点击可能已经发生，禁止自动重试",
+                        status="challenge", platform="twitter",
+                        challenge_url=challenge.get("url"))
+                else:
+                    result = _failed(
+                        challenge["hint"] + "；尚未发生平台写点击；完成验证后请人工发起一项新操作",
+                        retry_safe=False, status="challenge", platform="twitter",
+                        manual_intervention_required=True,
+                        challenge_url=challenge.get("url"))
             except asyncio.TimeoutError:
                 if tracker["attempted"]:
                     result = _uncertain("动作整体超时；写点击可能已经生效，禁止自动重试")
