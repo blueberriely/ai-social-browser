@@ -10,8 +10,8 @@
 
 | 服务 | 平台 | 动作 | 端口（示例） |
 |---|---|---|---|
-| `twitter-tool` | x.com | 读 3 个 + 写 5 个 | 8272 |
-| `xiaohongshu-tool` | xiaohongshu.com | 只读 4 个 | 8273 |
+| `twitter-tool` | x.com | 读 4 个 + 写 5 个 | 8272 |
+| `xiaohongshu-tool` | xiaohongshu.com | 只读 5 个 | 8273 |
 
 那台常驻 Chrome 本体在同仓库的 [`relay/`](../relay/README.md)（服务器上跑 headed Chrome + 远程调试端口，人和工具共用一个浏览器）。本目录就是"接上 relay 之后，agent 能干什么"的答案。
 
@@ -80,6 +80,7 @@ curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
 | `feed` | `query?` `n?`(≤30) `latest?` | 不带 `query` = 首页时间线；带 = 搜索；`latest: true` = 按最新排序 |
 | `profile` | `user?` `n?`(≤30) | 某人最近推文；不带 `user` 时回退到 `TW_DEFAULT_USER` |
 | `read` | `url` `n?`(≤40) | 单条推文 + 楼上线程 + 评论；此动作放行图片加载，能拿到图片直链 |
+| `watch` | `url` | 视频推文 + 浏览器实际播放时观察到的短时效媒体地址与时长 |
 
 每条推文返回：`url / time / author / handle / text / stats(回复·转发·赞) / liked_by_me / images / has_video / quoted_text / promoted(广告标记) / truncated(长文被折叠)`。
 
@@ -115,11 +116,37 @@ curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
 | `feed` | `n?`(≤30) | 发现页信息流 |
 | `search` | `query`(≤100字) `n?` | 搜索笔记 |
 | `read` | `url` `n?`(评论数≤40) | 笔记详情：标题/正文/图片(含 live photo 标记)/标签/互动数/我是否点过赞收藏/评论(含子评论、IP 属地) |
+| `watch` | `url` | 视频笔记 + 浏览器实际播放时观察到的短时效 CDN 地址与时长；不在动作服务内下载 |
 | `profile` | `url` 或 `user`(24位id) `n?` | 用户资料 + 最近笔记 |
 
 和 twitter-tool 一样，`feed`/`search`/`profile` 返回的笔记如果紧接着被 `read`，会在同一个仍开着的列表页里真实点击封面进详情（不 `goto` 硬跳），读完模拟返回把列表页留住；命中时列表结果里会带 `read_navigation: "card_click_available"` 提示可以这么用，`read` 返回结果里的 `navigation` 字段标实际走的是 `feed_card_click` 还是 `direct_url_fallback`；渲染出的 DOM 里找不到对应封面时返回 `{"ok": false, "navigation": "card_click_failed", ...}`，不会自动降级硬跳。命中平台的验证挑战时（如滑块）同样会中断返回 `{"outcome": "challenge", ...}`，提示掏手机去 [`relay/`](../relay/README.md) 里人工过一遍。
 
-**链接怎么传（重要）：** 小红书的笔记链接依赖 `xsec_token`——平台发的防爬签名，跟着链接走。给 `read` 传 URL 时，**直接用 `feed`/`search`/`profile` 返回结果里的 `url` 字段原样传**最稳；网页版复制的完整链接（带 token）也可用；App 分享出来的 `xhslink.com` 短链直接传即可，`read`/`profile` 会**自动展开**成主站链接再走原流程（展开时只向 xhslink 域名发请求、拿到主站链接就停，中途跳到白名单外的域名一律拒绝）。只拿笔记 ID 自己拼的裸链接没有 token，多半打不开（表现为"等待笔记详情超时：链接可能缺少有效 xsec_token"）。
+**链接怎么传（重要）：** 小红书的笔记链接依赖 `xsec_token`——平台发的防爬签名，跟着链接走。给 `read` 传 URL 时，**直接用 `feed`/`search`/`profile` 返回结果里的 `url` 字段原样传**最稳；网页版复制的完整链接（带 token）也可用；App 分享出来的 `xhslink.com` 或 `xhslink.cn` 短链直接传即可，`read`/`watch`/`profile` 会**自动展开**成主站链接再走原流程（展开时只向 xhslink 域名发请求、拿到主站链接就停，中途跳到白名单外的域名一律拒绝）。只拿笔记 ID 自己拼的裸链接没有 token，多半打不开（表现为"等待笔记详情超时：链接可能缺少有效 xsec_token"）。
+
+## 统一 Social Browser MCP
+
+`social-browser-mcp/server.py` 是两个动作服务之上的统一 STDIO MCP 适配器。它不读取 Cookie，仍通过仅监听本机的动作服务复用固定浏览器登录态：`xhs_*` 提供小红书发现页、搜索、读取、主页和视频；`x_*` 提供X时间线／搜索、读取、主页和视频；`video_watch` 处理普通本地视频或安全的公网HTTPS视频直链。
+
+三个视频入口共用同一处理核心：在临时目录中抽取八格画面，并在配置了 whisper.cpp 时生成原始转写；调用结束后临时视频、音频与画面会自动清理。视频限制默认100 MiB、10分钟，可通过环境变量收紧。平台视频只接受各自CDN；普通视频直链必须是解析到公网地址的无凭据HTTPS链接，每次跳转都会重新校验。读取本地文件默认关闭，只有 `SOCIAL_VIDEO_ROOTS` 明确列出的目录可用。
+
+X写工具默认不出现在MCP工具列表中。只有设置 `SOCIAL_ENABLE_X_WRITE=1` 才会出现点赞、转发、回复和发帖；底层动作服务仍执行频率闸、审计与三态确认，`uncertain` 结果不得自动重试。小红书始终只读。
+
+视频画面需要 `ffmpeg` 与 `ffprobe`。音频转写可选：安装 whisper.cpp 后，将 `whisper-cli` 放进 `PATH`，并设置模型路径：
+
+```bash
+export SOCIAL_WHISPER_MODEL=/path/to/ggml-base.bin
+# whisper-cli 不在 PATH 时再设置：
+export SOCIAL_WHISPER=/path/to/whisper-cli
+```
+
+```toml
+[mcp_servers.social-browser]
+command = "/usr/bin/python3"
+args = ["/opt/ai-social-browser/actions/social-browser-mcp/server.py"]
+env = { SOCIAL_WHISPER_MODEL = "/path/to/ggml-base.bin", SOCIAL_VIDEO_ROOTS = "/path/to/allowed/videos" }
+```
+
+适配器默认连接 `http://127.0.0.1:8272/twitter` 与 `http://127.0.0.1:8273/xiaohongshu`；动作服务位于其他地址时设置 `X_ACTION_URL` 或 `XHS_ACTION_URL`。不要把动作端口或Chrome CDP端口直接暴露到公网。
 
 安全阀：`read`/`profile` 只接受 `xiaohongshu.com` 主站 URL，不会被当成任意网页抓取器用。
 

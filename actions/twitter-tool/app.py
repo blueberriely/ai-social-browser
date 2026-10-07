@@ -831,6 +831,72 @@ async def act_read(ctx, body):
         await _close_owned_page(page)
 
 
+async def act_watch(ctx, body):
+    """Read a video tweet and expose media requested by the logged-in Chrome."""
+    url = (body.get("url") or "").strip()
+    sid = _status_id(url)
+    if not sid:
+        return {"ok": False, "error": "url 不像推文链接，要形如 https://x.com/xxx/status/123..."}
+    n = min(int(body.get("n", 15)), 40)
+    media_urls = []
+    page = await new_page(ctx, block_images=False)
+
+    def remember_media(request):
+        lowered = request.url.lower()
+        # X currently plays many videos through MediaSource, so the <video>
+        # element only exposes a blob: URL and the useful playlist requests
+        # are reported as XHR.  Record the first trusted media request; this is
+        # normally the master playlist rather than one audio/video fragment.
+        if (
+            "video.twimg.com/" in lowered
+            and (".m3u8" in lowered or ".mp4" in lowered)
+            and request.url not in media_urls
+        ):
+            media_urls.append(request.url)
+
+    page.on("request", remember_media)
+    try:
+        await goto(page, f"{BASE}/i/status/{sid}")
+        result = await _extract_tweet_detail(page, sid, n)
+        if not result.get("ok"):
+            return result
+        tweet = result.get("tweet") or {}
+        try:
+            await page.wait_for_function(
+                """() => [...document.querySelectorAll('video')].some(
+                  video => Number.isFinite(video.duration) && video.duration > 0
+                )""",
+                timeout=12000,
+            )
+        except PWTimeout:
+            await _raise_if_challenge(page)
+        await page.wait_for_timeout(1000)
+        playback = await page.evaluate(
+            """() => {
+              const video = [...document.querySelectorAll('video')].find(
+                item => Number.isFinite(item.duration) && item.duration > 0
+              );
+              return video ? {
+                duration_seconds: video.duration,
+                width: video.videoWidth || null,
+                height: video.videoHeight || null,
+              } : {};
+            }"""
+        )
+        if not playback and not media_urls:
+            return {**result, "ok": False, "error": "这条推文没有可识别的视频"}
+        return {
+            **result,
+            "action": "watch",
+            "navigation": "direct_url_fallback",
+            "video": {**playback, "url": media_urls[0] if media_urls else None},
+            "media_extraction": "observed_browser_request",
+        }
+    finally:
+        page.remove_listener("request", remember_media)
+        await _close_owned_page(page)
+
+
 # ---------- 写动作 ----------
 
 
@@ -1069,7 +1135,12 @@ async def act_post(ctx, body):
 
 # ---------- 路由 ----------
 
-READ_ACTIONS = {"feed": act_feed, "profile": act_profile, "read": act_read}
+READ_ACTIONS = {
+    "feed": act_feed,
+    "profile": act_profile,
+    "read": act_read,
+    "watch": act_watch,
+}
 WRITE_ACTIONS = {"like": act_like,
                  "unlike": lambda c, b: act_like(c, b, undo=True),
                  "repost": act_repost, "reply": act_reply, "post": act_post}
@@ -1177,4 +1248,4 @@ async def twitter(req: Request):
                         "result": result})
             return result
     return _failed(
-        f"不认识的 action: {action}。可用: feed/profile/read/like/unlike/repost/reply/post")
+        f"不认识的 action: {action}。可用: feed/profile/read/watch/like/unlike/repost/reply/post")

@@ -9,7 +9,8 @@ POST /xiaohongshu
   {"action":"read", "url":"https://www.xiaohongshu.com/...", "n":10}
   {"action":"profile", "url":"https://www.xiaohongshu.com/user/profile/...", "n":10}
 
-read/profile 的 url 支持 App 分享的 xhslink.com 短链，会先自动展开成主站链接。
+read/profile/watch 的 url 支持 App 分享的 xhslink.com 与 xhslink.cn 短链，
+会先自动展开成主站链接。
 只读边界：允许为搜索进行导航、点击、输入、滚动和 DOM 读取；不包含发布或互动写动作。
 """
 
@@ -165,7 +166,9 @@ def _is_short_link(value):
     if not isinstance(value, str):
         return False
     host = (urlparse(value.strip()).hostname or "").lower()
-    return host == "xhslink.com" or host.endswith(".xhslink.com")
+    return host in {"xhslink.com", "xhslink.cn"} or host.endswith(
+        (".xhslink.com", ".xhslink.cn")
+    )
 
 
 def _expand_short_link_sync(raw):
@@ -180,7 +183,10 @@ def _expand_short_link_sync(raw):
             return url
         if host == "m.xiaohongshu.com":
             return url.replace("//m.xiaohongshu.com", "//www.xiaohongshu.com", 1)
-        if not (host == "xhslink.com" or host.endswith(".xhslink.com")):
+        if not (
+            host in {"xhslink.com", "xhslink.cn"}
+            or host.endswith((".xhslink.com", ".xhslink.cn"))
+        ):
             raise ValueError(f"短链跳转到了白名单外的域名：{host or '(空)'}")
         request = urllib.request.Request(
             url, headers={"User-Agent": _SHORT_LINK_UA}, method="GET")
@@ -958,10 +964,72 @@ async def action_read(page, body, from_list=False):
     return result
 
 
+async def action_watch(page, body):
+    """Read a video note and expose the media request made by Chrome."""
+    media_urls = []
+
+    def remember_media(request):
+        url = request.url
+        lowered = url.lower()
+        if request.resource_type in {"media", "fetch"} and (
+            ".mp4" in lowered or ".m3u8" in lowered
+        ):
+            if url not in media_urls:
+                media_urls.append(url)
+
+    page.on("request", remember_media)
+    try:
+        result = await action_read(page, body)
+        if not result.get("ok"):
+            return result
+        note = result.get("note") or {}
+        if note.get("type") != "video":
+            return {
+                **result,
+                "action": "watch",
+                "ok": False,
+                "error": "这条笔记不是视频",
+            }
+        try:
+            await page.wait_for_function(
+                """() => [...document.querySelectorAll('video')].some(
+                  video => Number.isFinite(video.duration) && video.duration > 0
+                )""",
+                timeout=10000,
+            )
+        except PWTimeout:
+            await _raise_if_challenge(page)
+        await page.wait_for_timeout(800)
+        playback = await page.evaluate(
+            """() => {
+              const video = [...document.querySelectorAll('video')].find(
+                item => Number.isFinite(item.duration) && item.duration > 0
+              );
+              return video ? {
+                duration_seconds: video.duration,
+                width: video.videoWidth || null,
+                height: video.videoHeight || null,
+              } : {};
+            }"""
+        )
+        return {
+            **result,
+            "action": "watch",
+            "video": {
+                **playback,
+                "url": media_urls[-1] if media_urls else None,
+            },
+            "media_extraction": "observed_browser_request",
+        }
+    finally:
+        page.remove_listener("request", remember_media)
+
+
 ACTIONS = {
     "feed": action_feed,
     "search": action_search,
     "read": action_read,
+    "watch": action_watch,
     "profile": action_profile,
 }
 
@@ -996,7 +1064,7 @@ async def xiaohongshu(request: Request):
     if action not in ACTIONS:
         return {
             "ok": False,
-            "error": "不支持的 action；只读动作只有 feed、search、read、profile",
+            "error": "不支持的 action；只读动作只有 feed、search、read、watch、profile",
             "allowed_actions": sorted(ACTIONS),
         }
 

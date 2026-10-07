@@ -31,7 +31,7 @@ flowchart LR
     Relay -- "CDP：画面 + 导航 (:9333)" --> Chrome["headed Chrome<br/>(xvfb 虚拟屏幕)"]
     Relay -- "X11 输入注入 (XTEST)" --> Xvfb["X server<br/>(同一块 DISPLAY)"]
     Xvfb -.托管窗口.-> Chrome
-    CF[cloudflared 隧道] --> Relay
+    Public["可选公网入口<br/>Cloudflare Tunnel / 自有反代 / VPN"] -.-> Relay
 ```
 
 工作原理一句话：relay 用 CDP 的 `Page.startScreencast` 把页面帧拿出来推给手机；手机的触摸/滚动/键盘事件不再走 CDP，而是通过 X11 的 XTEST 扩展直接对 Chrome 所在的 X server 发送系统级合成输入事件——启动时会自动打开一个校准页，用真实收到的鼠标事件反推出 Chrome 窗口在虚拟屏幕上的像素偏移，手机端坐标才能精确落到窗口内的正确位置。手机端是一个纯静态页面，密码登录后即用，无需装任何 App。
@@ -52,7 +52,7 @@ Mac 和 Linux 桌面环境直接可用（自动探测 Chrome / Chromium 路径�
 
 ## VPS 部署
 
-从零抄命令的完整版（xvfb + systemd + cloudflare tunnel）在[仓库根 README](../README.md) 的 Step 1，2GB 小机实测。要点只有两条：8271 端口永远只绑 `127.0.0.1`，TLS 和公网入口交给隧道；systemd unit 和资源红线模板都在本目录 `deploy/` 下。
+从零抄命令的完整版（xvfb + systemd，并以 Cloudflare Tunnel 作为可选公网入口示例）在[仓库根 README](../README.md) 的 Step 1，2GB 小机实测。Cloudflare 并非必需：可以改用自有反代、VPN，或不开放手机远程入口。要点只有两条：8271 端口不要裸露公网；若需要跨公网访问，必须配置 TLS 与强鉴权。systemd unit 和资源红线模板都在本目录 `deploy/` 下。
 
 ## 内存守护（可选，小内存机器强烈建议）
 
